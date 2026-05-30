@@ -1,8 +1,8 @@
 {
-  "name": "@flowdex/runtime",
+  "name": "flowdex",
   "version": "0.1.0",
+  "private": true,
   "description": "Runtime-backed workflow orchestration for Codex-style sub-agent fanout",
-  "type": "module",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/my-name-is-yu/flowdex.git"
@@ -11,37 +11,11 @@
   "bugs": {
     "url": "https://github.com/my-name-is-yu/flowdex/issues"
   },
-  "bin": {
-    "flowdex": "./dist/cli.js"
-  },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./runtime": {
-      "types": "./dist/runtime/runtime.d.ts",
-      "import": "./dist/runtime/runtime.js"
-    },
-    "./state": {
-      "types": "./dist/store/state.d.ts",
-      "import": "./dist/store/state.js"
-    }
-  },
-  "files": [
-    "dist",
-    "skills",
-    "examples",
-    "README.md"
-  ],
   "scripts": {
-    "clean": "rm -rf dist",
-    "build": "npm run clean && tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && vitest run",
-    "check": "npm run typecheck && npm run test"
+    "build": "cargo build --release",
+    "typecheck": "cargo check",
+    "test": "cargo test",
+    "check": "cargo fmt --all -- --check && cargo test"
   },
   "keywords": [
     "workflow",
@@ -49,10 +23,5 @@
     "agents"
   ],
   "author": "",
-  "license": "MIT",
-  "devDependencies": {
-    "@types/node": "^25.9.1",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
-  }
+  "license": "MIT"
 }

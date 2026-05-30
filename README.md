@@ -18,31 +18,29 @@ authoritative semantics live in the `flowdex` CLI/runtime:
 ## Commands
 
 ```sh
-npm install
-npm run build
-npm link # optional; exposes the flowdex binary from the @flowdex/runtime package
+cargo build
 
-node dist/cli.js preview examples/hello.ts
-node dist/cli.js run examples/hello.ts --yes
-node dist/cli.js run examples/code-audit.ts --yes
-node dist/cli.js next <run-id> --json --files
-node dist/cli.js attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <native-id>
-node dist/cli.js collect-results <run-id> --continue --json
-node dist/cli.js status <run-id> --json --compact
-node dist/cli.js watch <run-id>
-node dist/cli.js list
-node dist/cli.js inspect <run-id>
-node dist/cli.js report <run-id> [--path json.path] [--raw]
-node dist/cli.js report <run-id> --paths
-node dist/cli.js complete-agent <run-id> <child-key> --lease-token <token> --result @<result-path>
-node dist/cli.js resume <run-id>
-node dist/cli.js pause <run-id>
-node dist/cli.js stop <run-id>
-node dist/cli.js repair-events <run-id>
-node dist/cli.js restart-agent <run-id> <op-key>
-node dist/cli.js save <run-id> <name>
-node dist/cli.js workflow list
-node dist/cli.js init code-audit .flowdex/workflows/code-audit.ts
+cargo run -- preview examples/hello.ts
+cargo run -- run examples/hello.ts --yes
+cargo run -- run examples/code-audit.ts --yes
+cargo run -- next <run-id> --json --files
+cargo run -- attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <native-id>
+cargo run -- collect-results <run-id> --continue --json
+cargo run -- status <run-id> --json --compact
+cargo run -- watch <run-id>
+cargo run -- list
+cargo run -- inspect <run-id>
+cargo run -- report <run-id> [--path json.path] [--raw]
+cargo run -- report <run-id> --paths
+cargo run -- complete-agent <run-id> <child-key> --lease-token <token> --result @<result-path>
+cargo run -- resume <run-id>
+cargo run -- pause <run-id>
+cargo run -- stop <run-id>
+cargo run -- repair-events <run-id>
+cargo run -- restart-agent <run-id> <op-key>
+cargo run -- save <run-id> <name>
+cargo run -- workflow list
+cargo run -- init code-audit .flowdex/workflows/code-audit.ts
 ```
 
 ## Workflow Contract
@@ -69,7 +67,7 @@ reports are filtered through host-verified evidence. `fileRange` evidence must
 point at existing lines in a snapshot, and `command` / `test` evidence must
 match a Flowdex-owned host command result, including argv and exit code.
 
-Agent tasks create dispatch records for the `$flowdex` skill bridge. The Node
+Agent tasks create dispatch records for the `$flowdex` skill bridge. The Rust
 runtime does not directly spawn Codex Desktop native subagents. In Desktop, the
 parent Codex session reads `flowdex next --files`, spawns exactly those native
 subagents with the returned `agentPrompt`, attaches their native ids, and lets
@@ -129,6 +127,8 @@ stale.
 ## Verification
 
 ```sh
-npm run check
-npm run build
+cargo fmt --all -- --check
+cargo test
+cargo run -- preview examples/hello.ts
+cargo run -- preview examples/code-audit.ts
 ```
