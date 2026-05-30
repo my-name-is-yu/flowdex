@@ -1,69 +1,74 @@
-use crate::canonical::{hash_canonical, sha256_bytes, stable_stringify, to_canonical_value};
-use crate::types::{ParsedWorkflow, WorkflowManifest};
+use crate::canonical::{
+    canonicalize, hash_canonical, sha256_bytes, stable_stringify, to_canonical_value,
+};
+use crate::sandbox::operation_key_for_parts;
+use crate::types::{AgentTask, ParsedWorkflow, WorkflowDocument, WorkflowManifest, WorkflowStep};
 use anyhow::{Result, anyhow, bail};
-use regex::Regex;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-const BODY_POLICY_VERSION: &str = "flowdex-body-policy-v0.5.0-rust";
+pub const WORKFLOW_FORMAT_VERSION: &str = "flowdex.workflow.v1";
+pub const WORKFLOW_FILE_SUFFIX: &str = ".flowdex.json";
+
 const SNAPSHOT_POLICY_VERSION: &str = "flowdex-snapshot-policy-v0.5.0-rust";
 const EVIDENCE_POLICY_VERSION: &str = "flowdex-evidence-policy-v0.5.0-rust";
 const RUNTIME_VERSION: &str = "flowdex-runtime-v0.1.0-rust";
+const STATIC_PARSER_VERSION: &str = "flowdex-static-parser-v1";
+const STATIC_EVALUATOR_VERSION: &str = "flowdex-static-evaluator-v1";
+
+pub fn parse_workflow_document(source: &str, file_name: &str) -> Result<ParsedWorkflow> {
+    if !has_workflow_source_file_name(file_name) {
+        bail!("{file_name}: workflow source file name must end in {WORKFLOW_FILE_SUFFIX}");
+    }
+    if source.trim_start().starts_with("import ") {
+        bail!("{file_name}: workflow source must be a static {WORKFLOW_FILE_SUFFIX} document");
+    }
+    let document_value = canonicalize(&json5::from_str::<Value>(source)?)?;
+    let document: WorkflowDocument = serde_json::from_value(document_value.clone())?;
+    validate_workflow_document(&document, file_name)?;
+    parsed_workflow_from_document(source.as_bytes(), document)
+}
+
+fn has_workflow_source_file_name(file_name: &str) -> bool {
+    file_name.ends_with(WORKFLOW_FILE_SUFFIX)
+}
+
+pub fn parse_run_workflow_source(source: &str, file_name: &str) -> Result<ParsedWorkflow> {
+    parse_workflow_document(source, file_name)
+}
 
 pub fn parse_workflow_source(source: &str, file_name: &str) -> Result<ParsedWorkflow> {
-    validate_runtime_import(source)?;
-    let workflow_start = source
-        .find("workflow")
-        .ok_or_else(|| anyhow!("{file_name}: export default must call workflow(...)"))?;
-    let open_paren = source[workflow_start..]
-        .find('(')
-        .map(|index| workflow_start + index)
-        .ok_or_else(|| anyhow!("{file_name}: workflow(...) must receive manifest and callback"))?;
-    let manifest_start = next_non_ws(source, open_paren + 1)
-        .ok_or_else(|| anyhow!("{file_name}: workflow manifest is missing"))?;
-    if source.as_bytes().get(manifest_start) != Some(&b'{') {
-        bail!("{file_name}: workflow manifest must be a static object literal");
-    }
-    let manifest_end = find_matching(source, manifest_start, b'{', b'}')?;
-    let manifest_text = &source[manifest_start..=manifest_end];
-    let callback_start = source[manifest_end + 1..]
-        .find("async")
-        .map(|index| manifest_end + 1 + index)
-        .ok_or_else(|| anyhow!("{file_name}: workflow callback must be async"))?;
-    let body_start = source[callback_start..]
-        .find('{')
-        .map(|index| callback_start + index)
-        .ok_or_else(|| anyhow!("{file_name}: workflow body must be a block"))?;
-    let body_end = find_matching(source, body_start, b'{', b'}')?;
-    let body = source[body_start + 1..body_end].to_string();
-    validate_body_policy(&body)?;
+    parse_workflow_document(source, file_name)
+}
 
-    let manifest_value = crate::canonical::canonicalize(&json5::from_str::<Value>(manifest_text)?)?;
-    let manifest: WorkflowManifest = serde_json::from_value(manifest_value.clone())?;
-    validate_manifest_shape(&manifest)?;
-
-    let source_hash = sha256_bytes(source.as_bytes());
+fn parsed_workflow_from_document(
+    source_bytes: &[u8],
+    document: WorkflowDocument,
+) -> Result<ParsedWorkflow> {
+    let manifest_value = to_canonical_value(&document.manifest)?;
+    let steps_value = to_canonical_value(&document.steps)?;
+    let source_hash = sha256_bytes(source_bytes);
     let manifest_hash = hash_canonical(&manifest_value)?;
-    let approval_hash = sha256_bytes(stable_stringify(&json!({
+    let approval_payload = json!({
         "sourceHash": source_hash,
         "manifestHash": manifest_hash,
-        "bodyPolicyVersion": BODY_POLICY_VERSION,
-        "parserVersion": "json5+flowdex-rust",
-        "transformVersion": "flowdex-rust-interpreter",
-        "harnessVersion": "flowdex-harness-v0.5.0-rust",
+        "stepsHash": hash_canonical(&steps_value)?,
+        "workflowFormatVersion": WORKFLOW_FORMAT_VERSION,
+        "parserVersion": STATIC_PARSER_VERSION,
+        "evaluatorVersion": STATIC_EVALUATOR_VERSION,
         "runtimeVersion": RUNTIME_VERSION,
         "snapshotPolicyVersion": SNAPSHOT_POLICY_VERSION,
         "evidencePolicyVersion": EVIDENCE_POLICY_VERSION,
-        "permissionCapabilityPolicyHash": hash_canonical(&to_canonical_value(&manifest.permissions)?)?,
-        "adapterPolicyHash": hash_canonical(&to_canonical_value(&manifest.adapters)?)?
-    }))?);
-
+        "permissionCapabilityPolicyHash": hash_canonical(&to_canonical_value(&document.manifest.permissions)?)?,
+        "adapterPolicyHash": hash_canonical(&to_canonical_value(&document.manifest.adapters)?)?
+    });
+    let approval_hash = sha256_bytes(stable_stringify(&approval_payload)?);
     Ok(ParsedWorkflow {
-        manifest,
+        manifest: document.manifest.clone(),
         source_hash,
         manifest_hash,
         approval_hash,
-        workflow_body: body,
+        document,
     })
 }
 
@@ -84,10 +89,18 @@ pub fn format_preview(parsed: &ParsedWorkflow) -> Result<String> {
         .map(|phase| format!("{}({})", phase.id, phase.max_agents))
         .collect::<Vec<_>>()
         .join(", ");
+    let steps = parsed
+        .document
+        .steps
+        .iter()
+        .map(step_summary)
+        .collect::<Vec<_>>()
+        .join(", ");
     let manifest_json = stable_stringify(&to_canonical_value(manifest)?)?;
     Ok(format!(
-        "Flowdex preview\nworkflow: {}\nsourceHash: {}\nmanifestHash: {}\napprovalHash: {}\nmaxAgents: {}\nmaxConcurrency: {}\ndefaultAdapter: {}\nnetwork: {}\nread: {}\nwrite: {}\nphases: {}\nmanifest: {}",
+        "Flowdex preview\nworkflow: {}\nformat: {}\nsourceHash: {}\nmanifestHash: {}\napprovalHash: {}\nmaxAgents: {}\nmaxConcurrency: {}\ndefaultAdapter: {}\nnetwork: {}\nread: {}\nwrite: {}\nphases: {}\nsteps: {}\nmanifest: {}",
         manifest.name,
+        parsed.document.version,
         parsed.source_hash,
         parsed.manifest_hash,
         parsed.approval_hash,
@@ -98,21 +111,20 @@ pub fn format_preview(parsed: &ParsedWorkflow) -> Result<String> {
         manifest.permissions.read.join(", "),
         manifest.permissions.write.join(", "),
         phases,
+        steps,
         manifest_json
     ))
 }
 
-fn validate_runtime_import(source: &str) -> Result<()> {
-    let import_re =
-        Regex::new(r#"(?m)^\s*import\s*\{\s*workflow\s*\}\s*from\s*["']@flowdex/runtime["'];\s*"#)?;
-    if !import_re.is_match(source) {
-        bail!("first statement must be import {{ workflow }} from \"@flowdex/runtime\"");
+fn step_summary(step: &WorkflowStep) -> String {
+    match step {
+        WorkflowStep::HostCommand { id, .. } => format!("hostCommand:{id}"),
+        WorkflowStep::Agent { id, .. } => format!("agent:{id}"),
+        WorkflowStep::Fanout { id, tasks, .. } => format!("fanout:{id}[{}]", tasks.len()),
+        WorkflowStep::Integrate { id, .. } => format!("integrate:{id}"),
+        WorkflowStep::Claim { id, .. } => format!("claim:{id}"),
+        WorkflowStep::Report { id, .. } => format!("report:{id}"),
     }
-    let export_count = source.matches("export default workflow").count();
-    if export_count != 1 {
-        bail!("workflow source must contain exactly one export default workflow call");
-    }
-    Ok(())
 }
 
 pub fn validate_manifest_shape(manifest: &WorkflowManifest) -> Result<()> {
@@ -185,119 +197,235 @@ pub fn validate_manifest_shape(manifest: &WorkflowManifest) -> Result<()> {
     Ok(())
 }
 
-fn validate_body_policy(body: &str) -> Result<()> {
-    let searchable = erase_strings_and_comments(body);
-    let forbidden = [
-        "globalThis",
-        "Date",
-        "eval",
-        "Function",
-        "Promise",
-        "process",
-        "Deno",
-        "fetch",
-        "console",
-        "Buffer",
-        "setTimeout",
-        "setInterval",
-        "new ",
-        "class ",
-        "try ",
-        "catch ",
-        "constructor",
-        "__proto__",
-        "ctx =",
-        "ctx.",
-    ];
-    for token in forbidden {
-        if token == "ctx." {
-            continue;
-        }
-        if searchable.contains(token) {
-            bail!("workflow body contains forbidden construct: {token}");
-        }
+fn validate_workflow_document(document: &WorkflowDocument, file_name: &str) -> Result<()> {
+    if document.version != WORKFLOW_FORMAT_VERSION {
+        bail!("{file_name}: version must be {WORKFLOW_FORMAT_VERSION}");
     }
-    let allowed_ctx = Regex::new(
-        r#"ctx\.(agent|fanout|hostCommand|integrate|claim|report|now|isFlowdexPending)\s*\("#,
-    )?;
-    for captures in Regex::new(r#"ctx\.[A-Za-z_][A-Za-z0-9_]*"#)?.find_iter(body) {
-        let tail = &body[captures.start()..];
-        if !allowed_ctx.is_match(tail) {
-            bail!(
-                "workflow body contains unsupported ctx access: {}",
-                captures.as_str()
-            );
+    validate_manifest_shape(&document.manifest)?;
+    let phases = document
+        .manifest
+        .phases
+        .iter()
+        .map(|phase| phase.id.as_str())
+        .collect::<HashSet<_>>();
+    let command_ids = document
+        .manifest
+        .permissions
+        .host_commands
+        .iter()
+        .map(|command| command.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen_ids = HashSet::new();
+    let mut prior_operations = HashSet::new();
+    for step in &document.steps {
+        let step_id = step_id(step);
+        if !is_safe_id(step_id) || !seen_ids.insert(step_id.to_string()) {
+            bail!("{file_name}: step ids must be unique safe ids");
+        }
+        match step {
+            WorkflowStep::HostCommand {
+                id,
+                phase,
+                command_id,
+            } => {
+                ensure_phase(&phases, phase)?;
+                if !command_ids.contains(command_id.as_str()) {
+                    bail!("{file_name}: unknown host command id: {command_id}");
+                }
+                prior_operations.insert(operation_key_for_parts("hostCommand", id));
+            }
+            WorkflowStep::Agent {
+                id,
+                phase,
+                mode,
+                prompt,
+                schema,
+                adapter,
+                model,
+                reasoning_effort,
+                network,
+                role,
+                nickname,
+                data,
+            } => {
+                ensure_phase(&phases, phase)?;
+                validate_agent_task(
+                    &AgentTask {
+                        id: id.clone(),
+                        phase: phase.clone(),
+                        mode: mode.clone(),
+                        prompt: prompt.clone(),
+                        schema: schema.clone(),
+                        adapter: adapter.clone(),
+                        model: model.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                        network: network.clone(),
+                        role: role.clone(),
+                        nickname: nickname.clone(),
+                        data: data.clone(),
+                    },
+                    &document.manifest,
+                )?;
+                if let Some(data) = data {
+                    validate_references(data, &prior_operations)?;
+                }
+                prior_operations.insert(operation_key_for_parts("agent", id));
+            }
+            WorkflowStep::Fanout { id, phase, tasks } => {
+                ensure_phase(&phases, phase)?;
+                validate_fanout_tasks(tasks, &document.manifest)?;
+                for task in tasks {
+                    if let Some(data) = &task.data {
+                        validate_references(data, &prior_operations)?;
+                    }
+                }
+                prior_operations.insert(operation_key_for_parts("fanout", id));
+            }
+            WorkflowStep::Integrate { id, phase, patches } => {
+                ensure_phase(&phases, phase)?;
+                for entry in patches {
+                    validate_references(&entry.patch, &prior_operations)?;
+                }
+                prior_operations.insert(operation_key_for_parts("integrate", id));
+            }
+            WorkflowStep::Claim { claim, .. } => {
+                validate_references(claim, &prior_operations)?;
+            }
+            WorkflowStep::Report { value, .. } => {
+                validate_references(value, &prior_operations)?;
+            }
         }
     }
     Ok(())
 }
 
-fn erase_strings_and_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut output = String::with_capacity(source.len());
-    let mut index = 0usize;
-    let mut string_quote: Option<u8> = None;
-    let mut escaped = false;
-    let mut line_comment = false;
-    let mut block_comment = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let next = bytes.get(index + 1).copied();
-        if line_comment {
-            if byte == b'\n' {
-                line_comment = false;
-                output.push('\n');
-            } else {
-                output.push(' ');
-            }
-            index += 1;
-            continue;
-        }
-        if block_comment {
-            if byte == b'*' && next == Some(b'/') {
-                output.push_str("  ");
-                block_comment = false;
-                index += 2;
-            } else {
-                output.push(if byte == b'\n' { '\n' } else { ' ' });
-                index += 1;
-            }
-            continue;
-        }
-        if let Some(quote) = string_quote {
-            output.push(if byte == b'\n' { '\n' } else { ' ' });
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == quote {
-                string_quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'/' && next == Some(b'/') {
-            output.push_str("  ");
-            line_comment = true;
-            index += 2;
-            continue;
-        }
-        if byte == b'/' && next == Some(b'*') {
-            output.push_str("  ");
-            block_comment = true;
-            index += 2;
-            continue;
-        }
-        if matches!(byte, b'"' | b'\'' | b'`') {
-            output.push(' ');
-            string_quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        output.push(byte as char);
-        index += 1;
+fn ensure_phase(phases: &HashSet<&str>, phase: &str) -> Result<()> {
+    if !phases.contains(phase) {
+        bail!("unknown workflow phase: {phase}");
     }
-    output
+    Ok(())
+}
+
+fn validate_agent_task(task: &AgentTask, manifest: &WorkflowManifest) -> Result<()> {
+    if !is_safe_id(&task.id) {
+        bail!("agent task id is unsafe: {}", task.id);
+    }
+    if !manifest.phases.iter().any(|phase| phase.id == task.phase) {
+        bail!("unknown task phase: {}", task.phase);
+    }
+    if task.mode != "read-only" && task.mode != "write" {
+        bail!("invalid task mode for {}", task.id);
+    }
+    if task.prompt.is_empty() {
+        bail!("agent task prompt is required: {}", task.id);
+    }
+    if let Some(adapter) = &task.adapter {
+        validate_adapter_name(adapter, manifest)?;
+    }
+    Ok(())
+}
+
+fn validate_fanout_tasks(tasks: &[AgentTask], manifest: &WorkflowManifest) -> Result<()> {
+    if tasks.len() as u64 > manifest.max_agents {
+        bail!("fanout task count exceeds manifest.maxAgents");
+    }
+    let mut seen = HashSet::new();
+    let mut per_phase = BTreeMap::<String, u64>::new();
+    for task in tasks {
+        validate_agent_task(task, manifest)?;
+        if !seen.insert(task.id.clone()) {
+            bail!("duplicate fanout task id: {}", task.id);
+        }
+        *per_phase.entry(task.phase.clone()).or_default() += 1;
+    }
+    for phase in &manifest.phases {
+        if per_phase.get(&phase.id).copied().unwrap_or(0) > phase.max_agents {
+            bail!("fanout phase {} exceeds maxAgents", phase.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_adapter_name(name: &str, manifest: &WorkflowManifest) -> Result<()> {
+    let known = name == "codex-native"
+        || manifest
+            .adapters
+            .as_ref()
+            .is_some_and(|adapters| adapters.contains_key(name));
+    if !known {
+        bail!("unknown adapter: {name}");
+    }
+    Ok(())
+}
+
+fn validate_references(value: &Value, prior_operations: &HashSet<String>) -> Result<()> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                validate_references(item, prior_operations)?;
+            }
+        }
+        Value::Object(object) => {
+            if let Some(result) = object.get("$result") {
+                let key = result
+                    .as_str()
+                    .ok_or_else(|| anyhow!("$result must be an operation key string"))?;
+                if !prior_operations.contains(key) {
+                    bail!("reference points to an undeclared or later operation: {key}");
+                }
+                if let Some(path) = object.get("path") {
+                    validate_reference_path(path)?;
+                }
+                if object.len() > 2 {
+                    bail!("$result reference may only contain path");
+                }
+                return Ok(());
+            }
+            if let Some(input) = object.get("$input") {
+                if input != &Value::Bool(true) {
+                    validate_reference_path(input)?;
+                }
+                if object.len() != 1 {
+                    bail!("$input reference may not include other fields");
+                }
+                return Ok(());
+            }
+            if object.contains_key("$now") {
+                if object.len() != 1 || object.get("$now") != Some(&Value::Bool(true)) {
+                    bail!("$now reference must be true");
+                }
+                return Ok(());
+            }
+            for item in object.values() {
+                validate_references(item, prior_operations)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_reference_path(path: &Value) -> Result<()> {
+    let Some(items) = path.as_array() else {
+        bail!("reference path must be an array");
+    };
+    for item in items {
+        if !item.is_string() && !item.as_u64().is_some() {
+            bail!("reference path entries must be strings or array indexes");
+        }
+    }
+    Ok(())
+}
+
+fn step_id(step: &WorkflowStep) -> &str {
+    match step {
+        WorkflowStep::HostCommand { id, .. }
+        | WorkflowStep::Agent { id, .. }
+        | WorkflowStep::Fanout { id, .. }
+        | WorkflowStep::Integrate { id, .. }
+        | WorkflowStep::Claim { id, .. }
+        | WorkflowStep::Report { id, .. } => id,
+    }
 }
 
 pub fn is_safe_id(value: &str) -> bool {
@@ -307,79 +435,4 @@ pub fn is_safe_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-}
-
-pub fn find_matching(text: &str, start: usize, open: u8, close: u8) -> Result<usize> {
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut index = start;
-    let mut string_quote: Option<u8> = None;
-    let mut escaped = false;
-    let mut line_comment = false;
-    let mut block_comment = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let next = bytes.get(index + 1).copied();
-        if line_comment {
-            if byte == b'\n' {
-                line_comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if block_comment {
-            if byte == b'*' && next == Some(b'/') {
-                block_comment = false;
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if let Some(quote) = string_quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == quote {
-                string_quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'/' && next == Some(b'/') {
-            line_comment = true;
-            index += 2;
-            continue;
-        }
-        if byte == b'/' && next == Some(b'*') {
-            block_comment = true;
-            index += 2;
-            continue;
-        }
-        if matches!(byte, b'"' | b'\'' | b'`') {
-            string_quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        if byte == open {
-            depth += 1;
-        } else if byte == close {
-            depth = depth
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("unbalanced delimiter"))?;
-            if depth == 0 {
-                return Ok(index);
-            }
-        }
-        index += 1;
-    }
-    bail!("unclosed delimiter")
-}
-
-fn next_non_ws(text: &str, start: usize) -> Option<usize> {
-    text.as_bytes()[start..]
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .map(|offset| start + offset)
 }

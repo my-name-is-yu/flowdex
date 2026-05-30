@@ -1,8 +1,8 @@
 use crate::artifacts::ArtifactStore;
 use crate::canonical::{stable_stringify, to_canonical_value};
 use crate::host_command::{command_result_for_storage, env_inherit_list, run_host_command};
-use crate::manifest::{format_preview, is_safe_id, parse_workflow_source};
-use crate::sandbox::{operation_key, run_sandbox_tick};
+use crate::manifest::{format_preview, is_safe_id, parse_workflow_document};
+use crate::sandbox::{evaluate_static_workflow_tick, operation_key};
 use crate::state::{EnsureAgentTask, FlowdexState};
 use crate::types::{
     AdapterConfig, AdapterResult, AgentTask, CanonicalValue, Claim, EvidenceRef, ParsedWorkflow,
@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const WORKFLOW_DOCUMENT_FILE: &str = "workflow.flowdex.json";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
@@ -56,12 +58,12 @@ impl FlowdexRuntime {
 
     pub fn preview(&self, workflow_path: &Path) -> Result<ParsedWorkflow> {
         let source = fs::read_to_string(workflow_path)?;
-        parse_workflow_source(&source, &workflow_path.to_string_lossy())
+        parse_workflow_document(&source, &workflow_path.to_string_lossy())
     }
 
     pub fn run(&self, workflow_path: &Path) -> Result<RunSummary> {
         let source = fs::read_to_string(workflow_path)?;
-        let parsed = parse_workflow_source(&source, &workflow_path.to_string_lossy())?;
+        let parsed = parse_workflow_document(&source, &workflow_path.to_string_lossy())?;
         if !self.options.auto_approve {
             bail!(
                 "Flowdex approval required. Re-run with --yes after reviewing:\n{}",
@@ -78,7 +80,7 @@ impl FlowdexRuntime {
         }
         let run_root = FlowdexState::run_directory(&self.options.cwd, &run_id)?;
         fs::create_dir_all(&run_root)?;
-        fs::write(run_root.join("workflow.ts"), source)?;
+        fs::write(run_root.join(WORKFLOW_DOCUMENT_FILE), source)?;
         fs::write(
             run_root.join("input.json"),
             stable_stringify(&self.options.input)?,
@@ -103,9 +105,9 @@ impl FlowdexRuntime {
 
     pub fn resume(&self, run_id: &str) -> Result<RunSummary> {
         let run_root = FlowdexState::run_directory(&self.options.cwd, run_id)?;
-        let source_path = run_root.join("workflow.ts");
+        let source_path = run_workflow_source_path(&run_root)?;
         let source = fs::read_to_string(&source_path)?;
-        let parsed = parse_workflow_source(&source, &source_path.to_string_lossy())?;
+        let parsed = parse_workflow_document(&source, &source_path.to_string_lossy())?;
         let input =
             serde_json::from_str::<Value>(&fs::read_to_string(run_root.join("input.json"))?)?;
         let artifact_store = ArtifactStore::new(run_root.join("artifacts"));
@@ -187,8 +189,8 @@ impl FlowdexRuntime {
             }
             state.heartbeat(run_id)?;
             let completed_results = state.get_completed_results(run_id)?;
-            let tick_result = run_sandbox_tick(
-                &parsed.workflow_body,
+            let tick_result = evaluate_static_workflow_tick(
+                &parsed.document,
                 input,
                 &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 &completed_results,
@@ -728,6 +730,14 @@ fn enforce_agent_budget(
 
 fn fanout_child_key(fanout_id: &str, task_id: &str) -> String {
     format!("fanout:{fanout_id}#{task_id}")
+}
+
+fn run_workflow_source_path(run_root: &Path) -> Result<PathBuf> {
+    let primary = run_root.join(WORKFLOW_DOCUMENT_FILE);
+    if primary.is_file() {
+        return Ok(primary);
+    }
+    bail!("run package is missing workflow.flowdex.json")
 }
 
 fn blocked_result(task: &AgentTask, reason: &str) -> AdapterResult {

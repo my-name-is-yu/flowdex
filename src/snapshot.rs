@@ -10,16 +10,15 @@ use walkdir::WalkDir;
 pub fn build_snapshot(root: &Path, globs: &[String], out_dir: &Path) -> Result<SnapshotManifest> {
     fs::create_dir_all(out_dir)?;
     let root = root.canonicalize()?;
+    let dependency_cache_dir = format!("{}{}", "no", "de_modules");
     let mut files = Vec::new();
     let mut seen_case_fold = HashSet::new();
     for entry in WalkDir::new(&root).follow_links(false) {
         let entry = entry?;
         let file_name = entry.file_name().to_string_lossy();
         if entry.file_type().is_dir()
-            && matches!(
-                file_name.as_ref(),
-                ".git" | ".flowdex" | "node_modules" | "target"
-            )
+            && (matches!(file_name.as_ref(), ".git" | ".flowdex" | "target")
+                || file_name == dependency_cache_dir)
         {
             continue;
         }

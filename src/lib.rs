@@ -14,5 +14,5 @@ pub mod templates;
 pub mod types;
 pub mod write_integration;
 
-pub use manifest::{format_preview, parse_workflow_source};
+pub use manifest::{format_preview, parse_workflow_document};
 pub use runtime::{FlowdexRuntime, RunSummary, RuntimeOptions};

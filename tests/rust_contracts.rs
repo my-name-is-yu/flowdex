@@ -1,5 +1,5 @@
 use flowdex::adapter_result::validate_adapter_result;
-use flowdex::manifest::parse_workflow_source;
+use flowdex::manifest::{parse_run_workflow_source, parse_workflow_document};
 use flowdex::native_dispatch::write_native_dispatch_file_package;
 use flowdex::report_path::read_report_path;
 use flowdex::runtime::{FlowdexRuntime, RuntimeOptions};
@@ -10,16 +10,36 @@ use std::fs;
 #[test]
 fn parses_bundled_examples() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let hello = fs::read_to_string(format!("{root}/examples/hello.ts")).unwrap();
-    let code_audit = fs::read_to_string(format!("{root}/examples/code-audit.ts")).unwrap();
+    let hello = fs::read_to_string(format!("{root}/examples/hello.flowdex.json")).unwrap();
+    let code_audit =
+        fs::read_to_string(format!("{root}/examples/code-audit.flowdex.json")).unwrap();
 
-    let hello = parse_workflow_source(&hello, "examples/hello.ts").unwrap();
-    let code_audit = parse_workflow_source(&code_audit, "examples/code-audit.ts").unwrap();
+    let hello = parse_workflow_document(&hello, "examples/hello.flowdex.json").unwrap();
+    let code_audit =
+        parse_workflow_document(&code_audit, "examples/code-audit.flowdex.json").unwrap();
 
     assert_eq!(hello.manifest.name, "hello-host-command");
     assert_eq!(code_audit.manifest.name, "code-audit");
     assert_eq!(code_audit.manifest.phases[0].id, "review");
     assert_eq!(hello.approval_hash.len(), 64);
+    assert_eq!(hello.document.steps.len(), 3);
+}
+
+#[test]
+fn rejects_import_prefixed_workflow_source() {
+    let source = r#"import "flowdex";
+{
+  "version": "flowdex.workflow.v1",
+  "manifest": {},
+  "steps": []
+}
+"#;
+    let file_name = "workflow.flowdex.json";
+    let error = parse_run_workflow_source(source, &file_name)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("workflow source must be a static .flowdex.json document"));
 }
 
 #[test]
@@ -57,7 +77,7 @@ fn runs_host_command_example_to_completed_report() {
     let mut options = RuntimeOptions::new(temp.path().to_path_buf());
     options.auto_approve = true;
     let summary = FlowdexRuntime::new(options)
-        .run(&std::path::Path::new(root).join("examples/hello.ts"))
+        .run(&std::path::Path::new(root).join("examples/hello.flowdex.json"))
         .unwrap();
 
     assert_eq!(summary.status, "completed");

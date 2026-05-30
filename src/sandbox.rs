@@ -1,232 +1,277 @@
-use crate::types::{CanonicalValue, ScheduledOperation, TickResult};
-use serde_json::json;
+use crate::canonical::{canonicalize, to_canonical_value};
+use crate::types::{
+    AgentTask, CanonicalValue, Claim, PatchSpec, ScheduledOperation, StagedEffects, TickResult,
+    WorkflowDocument, WorkflowStep,
+};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 pub fn operation_key(operation: &ScheduledOperation) -> String {
-    format!("{}:{}", operation.kind, operation.id)
+    operation_key_for_parts(&operation.kind, &operation.id)
 }
 
-pub fn run_sandbox_tick(
-    workflow_body: &str,
+pub fn operation_key_for_parts(kind: &str, id: &str) -> String {
+    format!("{kind}:{id}")
+}
+
+pub fn evaluate_static_workflow_tick(
+    document: &WorkflowDocument,
     input: &CanonicalValue,
     now: &str,
     results: &BTreeMap<String, CanonicalValue>,
 ) -> TickResult {
-    let script = build_harness(workflow_body, input, now, results);
-    let mut child = match Command::new("deno")
-        .args([
-            "run",
-            "--no-prompt",
-            "--no-config",
-            "--no-lock",
-            "--no-npm",
-            "--no-remote",
-            "--v8-flags=--max-old-space-size=128",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return TickResult::Failed {
-                error: error.to_string(),
-            };
+    evaluate_static_workflow_tick_inner(document, input, now, results).unwrap_or_else(|error| {
+        TickResult::Failed {
+            error: format!("{error:#}"),
         }
-    };
-
-    if let Some(stdin) = child.stdin.as_mut()
-        && let Err(error) = stdin.write_all(script.as_bytes())
-    {
-        return TickResult::Failed {
-            error: error.to_string(),
-        };
-    }
-    drop(child.stdin.take());
-
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
-            return TickResult::Failed {
-                error: error.to_string(),
-            };
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let Some(line) = stdout.trim().lines().last() else {
-        return TickResult::Failed {
-            error: if stderr.is_empty() {
-                "workflow produced no result".to_string()
-            } else {
-                stderr.into_owned()
-            },
-        };
-    };
-    serde_json::from_str::<TickResult>(line).unwrap_or_else(|error| TickResult::Failed {
-        error: format!("invalid sandbox result: {error}; stderr={stderr}"),
     })
 }
 
-fn build_harness(
-    workflow_body: &str,
+fn evaluate_static_workflow_tick_inner(
+    document: &WorkflowDocument,
     input: &CanonicalValue,
     now: &str,
     results: &BTreeMap<String, CanonicalValue>,
-) -> String {
-    let tick_input = json!({
-        "input": input,
-        "now": now,
-        "results": results
-    });
-    let serialized_input = serde_json::to_string(&tick_input)
-        .unwrap_or_else(|_| "{}".to_string())
-        .replace('<', "\\u003c");
-    format!(
-        r#"
-const __flowdexStdoutWrite = globalThis.Deno?.stdout?.writeSync?.bind(globalThis.Deno.stdout);
-const __forbiddenGlobals = ["Deno", "process", "require", "module", "window", "self", "document", "fetch", "XMLHttpRequest", "WebSocket", "navigator", "localStorage", "sessionStorage", "performance", "Date", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "WebAssembly", "Worker", "SharedWorker", "console"];
-for (const name of __forbiddenGlobals) {{
-  try {{ Object.defineProperty(globalThis, name, {{ value: undefined, writable: false, configurable: false }}); }} catch {{}}
-}}
-{runtime_source}
-const __flowdexWorkflow = {{ callback: async (ctx) => {{
-{workflow_body}
-}} }};
-const __tickInput = {serialized_input};
-const __staged = {{ claims: [], artifacts: [], reports: [] }};
-const __scheduled = [];
-let __suspended = false;
-class FlowdexPending extends Error {{
-  constructor(operation) {{
-    super("FlowdexPending");
-    this.name = "FlowdexPending";
-    this.__flowdexPending = true;
-    this.operation = operation;
-  }}
-}}
-function __opKey(kind, id) {{
-  return kind + ":" + id;
-}}
-function __ensureNotSuspended() {{
-  if (__suspended) throw new FlowdexPending({{ kind: "suspended", id: "suspended", phase: "suspended", args: null }});
-}}
-function __schedule(kind, args) {{
-  const canonicalArgs = __canonical(args);
-  const id = canonicalArgs && canonicalArgs.id;
-  const phase = canonicalArgs && canonicalArgs.phase;
-  if (typeof id !== "string" || typeof phase !== "string") {{
-    throw new Error(kind + " requires string id and phase");
-  }}
-  const operation = {{ kind, id, phase, args: canonicalArgs }};
-  __scheduled.push(operation);
-  __suspended = true;
-  throw new FlowdexPending(operation);
-}}
-const ctx = Object.freeze({{
-  input: __deepFreeze(__canonical(__tickInput.input)),
-  now: () => __tickInput.now,
-  pendingSignal: "FlowdexPending",
-  isFlowdexPending: (error) => !!(error && error.__flowdexPending),
-  agent: (args) => {{
-    __ensureNotSuspended();
-    const key = __opKey("agent", args && args.id);
-    if (Object.prototype.hasOwnProperty.call(__tickInput.results, key)) return __deepFreeze(__canonical(__tickInput.results[key]));
-    return __schedule("agent", args);
-  }},
-  fanout: (args) => {{
-    __ensureNotSuspended();
-    const key = __opKey("fanout", args && args.id);
-    if (Object.prototype.hasOwnProperty.call(__tickInput.results, key)) return __deepFreeze(__canonical(__tickInput.results[key]));
-    return __schedule("fanout", args);
-  }},
-  hostCommand: (args) => {{
-    __ensureNotSuspended();
-    const key = __opKey("hostCommand", args && args.id);
-    if (Object.prototype.hasOwnProperty.call(__tickInput.results, key)) return __deepFreeze(__canonical(__tickInput.results[key]));
-    return __schedule("hostCommand", args);
-  }},
-  integrate: (args) => {{
-    __ensureNotSuspended();
-    const key = __opKey("integrate", args && args.id);
-    if (Object.prototype.hasOwnProperty.call(__tickInput.results, key)) return __deepFreeze(__canonical(__tickInput.results[key]));
-    return __schedule("integrate", args);
-  }},
-  claim: (claim) => {{
-    __ensureNotSuspended();
-    __staged.claims.push(__canonical(claim));
-  }},
-  report: (report) => {{
-    __ensureNotSuspended();
-    const canonicalReport = __canonical(report);
-    __staged.reports.push(canonicalReport);
-    return canonicalReport;
-  }}
-}});
-(async () => {{
-  try {{
-    const value = await __flowdexWorkflow.callback(ctx);
-    const result = {{ status: "completed", value: __canonical(value ?? null), staged: __canonical(__staged) }};
-    globalThis.__flowdexWrite(JSON.stringify(result));
-  }} catch (error) {{
-    if (error && error.__flowdexPending) {{
-      globalThis.__flowdexWrite(JSON.stringify({{ status: "pending", scheduled: __canonical(__scheduled) }}));
-      return;
-    }}
-    globalThis.__flowdexWrite(JSON.stringify({{ status: "failed", error: String(error && error.stack ? error.stack : error) }}));
-  }}
-}})();
-"#,
-        runtime_source = canonical_runtime_source(),
-        workflow_body = workflow_body,
-        serialized_input = serialized_input
-    )
+) -> Result<TickResult> {
+    let mut staged = StagedEffects {
+        claims: vec![],
+        artifacts: vec![],
+        reports: vec![],
+    };
+
+    for step in &document.steps {
+        match step {
+            WorkflowStep::Claim { claim, .. } => {
+                let resolved = resolve_value(claim, input, now, results)?;
+                staged
+                    .claims
+                    .push(serde_json::from_value::<Claim>(resolved)?);
+            }
+            WorkflowStep::Report { value, .. } => {
+                let resolved = resolve_value(value, input, now, results)?;
+                let resolved = canonicalize(&resolved)?;
+                staged.reports.push(resolved.clone());
+                return Ok(TickResult::Completed {
+                    value: resolved,
+                    staged,
+                });
+            }
+            _ => {
+                let operation = scheduled_operation_from_step(step, input, now, results)?;
+                let key = operation_key(&operation);
+                if !results.contains_key(&key) {
+                    return Ok(TickResult::Pending {
+                        scheduled: vec![operation],
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(TickResult::Completed {
+        value: Value::Null,
+        staged,
+    })
 }
 
-fn canonical_runtime_source() -> &'static str {
-    r#"
-function __flowdexWrite(text) {
-  const bytes = new TextEncoder().encode(text + "\n");
-  return __flowdexStdoutWrite ? __flowdexStdoutWrite(bytes) : undefined;
+fn scheduled_operation_from_step(
+    step: &WorkflowStep,
+    input: &CanonicalValue,
+    now: &str,
+    results: &BTreeMap<String, CanonicalValue>,
+) -> Result<ScheduledOperation> {
+    match step {
+        WorkflowStep::HostCommand {
+            id,
+            phase,
+            command_id,
+        } => Ok(ScheduledOperation {
+            kind: "hostCommand".to_string(),
+            id: id.clone(),
+            phase: phase.clone(),
+            args: json!({ "id": id, "phase": phase, "commandId": command_id }),
+        }),
+        WorkflowStep::Agent {
+            id,
+            phase,
+            mode,
+            prompt,
+            schema,
+            adapter,
+            model,
+            reasoning_effort,
+            network,
+            role,
+            nickname,
+            data,
+        } => {
+            let data = data
+                .as_ref()
+                .map(|value| resolve_value(value, input, now, results))
+                .transpose()?;
+            let task = AgentTask {
+                id: id.clone(),
+                phase: phase.clone(),
+                mode: mode.clone(),
+                prompt: prompt.clone(),
+                schema: schema.clone(),
+                adapter: adapter.clone(),
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                network: network.clone(),
+                role: role.clone(),
+                nickname: nickname.clone(),
+                data,
+            };
+            Ok(ScheduledOperation {
+                kind: "agent".to_string(),
+                id: id.clone(),
+                phase: phase.clone(),
+                args: to_canonical_value(&task)?,
+            })
+        }
+        WorkflowStep::Fanout { id, phase, tasks } => {
+            let tasks = tasks
+                .iter()
+                .map(|task| {
+                    let mut task = task.clone();
+                    task.data = task
+                        .data
+                        .as_ref()
+                        .map(|value| resolve_value(value, input, now, results))
+                        .transpose()?;
+                    Ok(task)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ScheduledOperation {
+                kind: "fanout".to_string(),
+                id: id.clone(),
+                phase: phase.clone(),
+                args: json!({ "id": id, "phase": phase, "tasks": tasks }),
+            })
+        }
+        WorkflowStep::Integrate { id, phase, patches } => {
+            let patches = patches
+                .iter()
+                .map(|entry| resolve_patch_entry(entry, input, now, results))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ScheduledOperation {
+                kind: "integrate".to_string(),
+                id: id.clone(),
+                phase: phase.clone(),
+                args: json!({ "id": id, "phase": phase, "patches": patches }),
+            })
+        }
+        WorkflowStep::Claim { .. } | WorkflowStep::Report { .. } => {
+            bail!("claim and report steps are not schedulable")
+        }
+    }
 }
-globalThis.__flowdexWrite = __flowdexWrite;
-function __canonical(value, seen = new WeakSet()) {
-  if (value === null) return null;
-  const kind = typeof value;
-  if (kind === "string" || kind === "boolean") return value;
-  if (kind === "number") {
-    if (!Number.isFinite(value)) throw new Error("non-finite number cannot cross Flowdex boundary");
-    return value;
-  }
-  if (kind === "undefined" || kind === "bigint" || kind === "symbol" || kind === "function") {
-    throw new Error(kind + " cannot cross Flowdex boundary");
-  }
-  if (kind !== "object") throw new Error("unsupported boundary value");
-  if (seen.has(value)) throw new Error("cyclic value cannot cross Flowdex boundary");
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => __canonical(item, seen));
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new Error("prototype-bearing object cannot cross Flowdex boundary");
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const result = Object.create(null);
-  for (const key of Object.keys(descriptors).sort()) {
-    const descriptor = descriptors[key];
-    if (!descriptor || "get" in descriptor || "set" in descriptor) throw new Error("accessor property cannot cross Flowdex boundary");
-    result[key] = __canonical(descriptor.value, seen);
-  }
-  return result;
+
+fn resolve_patch_entry(
+    entry: &PatchSpec,
+    input: &CanonicalValue,
+    now: &str,
+    results: &BTreeMap<String, CanonicalValue>,
+) -> Result<Value> {
+    let patch = resolve_value(&entry.patch, input, now, results)?;
+    let Some(patch) = patch.as_str() else {
+        bail!("integrate patch entry must resolve to a string");
+    };
+    Ok(json!({ "patch": patch }))
 }
-function __deepFreeze(value) {
-  if (value && typeof value === "object") {
-    Object.freeze(value);
-    for (const item of Object.values(value)) __deepFreeze(item);
-  }
-  return value;
+
+fn resolve_value(
+    value: &Value,
+    input: &CanonicalValue,
+    now: &str,
+    results: &BTreeMap<String, CanonicalValue>,
+) -> Result<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => canonicalize(value),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| resolve_value(item, input, now, results))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|items| canonicalize(&Value::Array(items))),
+        Value::Object(object) => {
+            if object.contains_key("$result") {
+                return resolve_result_reference(object, results);
+            }
+            if object.contains_key("$input") {
+                return resolve_input_reference(object, input);
+            }
+            if object.contains_key("$now") {
+                if object.len() != 1 || object.get("$now") != Some(&Value::Bool(true)) {
+                    bail!("$now reference must be {{\"$now\":true}}");
+                }
+                return Ok(Value::String(now.to_string()));
+            }
+            let mut output = Map::new();
+            for (key, item) in object {
+                output.insert(key.clone(), resolve_value(item, input, now, results)?);
+            }
+            canonicalize(&Value::Object(output))
+        }
+    }
 }
-"#
+
+fn resolve_result_reference(
+    object: &Map<String, Value>,
+    results: &BTreeMap<String, CanonicalValue>,
+) -> Result<Value> {
+    if object.len() > 2 {
+        bail!("$result reference may only contain path");
+    }
+    let key = object
+        .get("$result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("$result reference requires an operation key"))?;
+    let value = results
+        .get(key)
+        .ok_or_else(|| anyhow!("unresolved operation reference: {key}"))?;
+    resolve_optional_path(value, object.get("path"))
+}
+
+fn resolve_input_reference(object: &Map<String, Value>, input: &CanonicalValue) -> Result<Value> {
+    if object.len() != 1 {
+        bail!("$input reference may only contain a path array or true");
+    }
+    match object.get("$input") {
+        Some(Value::Bool(true)) => canonicalize(input),
+        Some(path @ Value::Array(_)) => resolve_optional_path(input, Some(path)),
+        _ => bail!("$input reference requires true or a path array"),
+    }
+}
+
+fn resolve_optional_path(root: &Value, path: Option<&Value>) -> Result<Value> {
+    let Some(path) = path else {
+        return canonicalize(root);
+    };
+    let Some(items) = path.as_array() else {
+        bail!("reference path must be an array");
+    };
+    let mut current = root;
+    for item in items {
+        match item {
+            Value::String(key) => {
+                current = current
+                    .get(key)
+                    .ok_or_else(|| anyhow!("reference path is missing key: {key}"))?;
+            }
+            Value::Number(index) => {
+                let index = index
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("reference path index must be unsigned"))?
+                    as usize;
+                current = current
+                    .as_array()
+                    .and_then(|array| array.get(index))
+                    .ok_or_else(|| anyhow!("reference path is missing index: {index}"))?;
+            }
+            _ => bail!("reference path entries must be strings or array indexes"),
+        }
+    }
+    canonicalize(current)
 }
