@@ -1,10 +1,18 @@
 import { spawnSync } from "node:child_process";
 
 export function applyPatch(repoRoot: string, patch: string, allowedGlobs: string[]): void {
-  const changedPaths = patchChangedPaths(repoRoot, patch);
+  applyPatches(repoRoot, [patch], allowedGlobs);
+}
+
+export function applyPatches(repoRoot: string, patches: string[], allowedGlobs: string[]): void {
+  if (patches.length === 0) return;
+  const combined = patches.join("\n");
+  const changedPaths = patchChangedPaths(repoRoot, combined);
   validateWriteAllowlist(changedPaths, allowedGlobs);
-  const result = spawnSync("git", ["apply", "--3way", "-"], { cwd: repoRoot, input: patch, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
-  if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+  const check = spawnSync("git", ["apply", "--check", "--3way", "-"], { cwd: repoRoot, input: combined, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  if (check.status !== 0) throw new Error(check.stderr || check.stdout);
+  const apply = spawnSync("git", ["apply", "--3way", "-"], { cwd: repoRoot, input: combined, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  if (apply.status !== 0) throw new Error(apply.stderr || apply.stdout);
 }
 
 export function patchChangedPaths(repoRoot: string, patch: string): string[] {

@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FlowdexRuntime } from "../src/runtime/runtime.js";
+import { buildSnapshot } from "../src/runtime/snapshot.js";
 import { FlowdexState } from "../src/store/state.js";
 import type { AdapterResult } from "../src/types.js";
-import { sha256Bytes } from "../src/util/hash.js";
+import type { NativeDispatch } from "../src/types.js";
+import { sha256Bytes, stableStringify } from "../src/util/hash.js";
 
 let temp: string;
 
@@ -121,6 +123,63 @@ export default workflow({
     pausedState.close();
   });
 
+  it("returns completed reports without re-driving terminal runs", async () => {
+    const workflowPath = path.join(temp, "terminal-completed.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "terminal-completed",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  permissions: { read: ["**"], write: [], hostCommands: [], network: "none", env: { inherit: [] } },
+  phases: [{ id: "test", maxAgents: 1 }]
+}, async (ctx) => {
+  return ctx.report({ now: ctx.now() });
+});`
+    );
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 2, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    expect(summary.status).toBe("completed");
+
+    const resumed = await runtime.resume(summary.runId);
+
+    expect(resumed).toMatchObject({ status: "completed", report: summary.report });
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const completedEvents = state.listEvents(summary.runId).filter((event) => event.type === "workflow.completed");
+    expect(completedEvents).toHaveLength(1);
+    state.close();
+  });
+
+  it("does not implicitly retry failed terminal runs", async () => {
+    const workflowPath = path.join(temp, "terminal-failed.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "terminal-failed",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  permissions: { read: ["**"], write: [], hostCommands: [], network: "none", env: { inherit: [] } },
+  phases: [{ id: "test", maxAgents: 1 }]
+}, async (ctx) => {
+  ctx.claim({ id: "unsupported", text: "unsupported", kind: "finding", confidence: "high", evidence: [] });
+  return ctx.report({ claimIds: ["unsupported"] });
+});`
+    );
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 2, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    expect(summary.status).toBe("failed");
+
+    const resumed = await runtime.resume(summary.runId);
+
+    expect(resumed.status).toBe("failed");
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const failedEvents = state.listEvents(summary.runId).filter((event) => event.type === "workflow.failed");
+    expect(failedEvents).toHaveLength(1);
+    state.close();
+  });
+
   it("persists pending state when the tick budget is exhausted", async () => {
     const workflowPath = path.join(temp, "tick-budget.ts");
     await writeFile(
@@ -172,6 +231,112 @@ export default workflow({
     expect(state.getRunStatus(summary.runId)).toBe("failed");
     expect(state.getLatestCompletedReport(summary.runId)).toBeUndefined();
     state.close();
+  });
+
+  it("rejects command evidence that does not match the host-owned command result", async () => {
+    const workflowPath = path.join(temp, "bad-command-evidence.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "bad-command-evidence",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  permissions: {
+    read: ["**"],
+    write: [],
+    hostCommands: [{ id: "unit", argv: ["node", "-e", "console.log('ok')"], cwd: "project" }],
+    network: "none",
+    env: { inherit: [] }
+  },
+  phases: [{ id: "test", maxAgents: 1 }]
+}, async (ctx) => {
+  const unit = await ctx.hostCommand({ id: "unit.run", phase: "test", commandId: "unit" });
+  ctx.claim({
+    id: "unit-lied",
+    text: "The unit command did something else.",
+    kind: "verification",
+    confidence: "high",
+    evidence: [{ type: "command", artifactId: unit.data.stdoutArtifactId, command: ["node", "-e", "console.log('different')"], exitCode: unit.data.exitCode }]
+  });
+  return ctx.report({ claimIds: ["unit-lied"] });
+});`
+    );
+
+    const summary = await new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true }).run(workflowPath);
+
+    expect(summary.status).toBe("failed");
+  });
+
+  it("fails host commands that exceed the approved output cap", async () => {
+    const workflowPath = path.join(temp, "output-cap.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "output-cap",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  permissions: {
+    read: ["**"],
+    write: [],
+    hostCommands: [{ id: "noisy", argv: ["node", "-e", "process.stdout.write('x'.repeat(2048))"], cwd: "project", maxOutputBytes: 16 }],
+    network: "none",
+    env: { inherit: [] }
+  },
+  phases: [{ id: "test", maxAgents: 1 }]
+}, async (ctx) => {
+  const noisy = await ctx.hostCommand({ id: "noisy.run", phase: "test", commandId: "noisy" });
+  return ctx.report({ status: noisy.status, data: noisy.data });
+});`
+    );
+
+    const summary = await new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true }).run(workflowPath);
+
+    expect(summary.status).toBe("completed");
+    expect(summary.report).toMatchObject({
+      status: "failed",
+      data: { stdoutTruncated: true, maxOutputBytes: 16 }
+    });
+  });
+
+  it("passes only explicitly inherited environment variables to host commands", async () => {
+    process.env.FLOWDEX_TEST_ENV = "visible";
+    process.env.FLOWDEX_TEST_HIDDEN = "hidden";
+    const workflowPath = path.join(temp, "env-inherit.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "env-inherit",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  permissions: {
+    read: ["**"],
+    write: [],
+    hostCommands: [{ id: "env", argv: ["node", "-e", "console.log((process.env.FLOWDEX_TEST_ENV || '') + ':' + (process.env.FLOWDEX_TEST_HIDDEN || ''))"], cwd: "project" }],
+    network: "none",
+    env: { inherit: ["FLOWDEX_TEST_ENV"] }
+  },
+  phases: [{ id: "test", maxAgents: 1 }]
+}, async (ctx) => {
+  const env = await ctx.hostCommand({ id: "env.run", phase: "test", commandId: "env" });
+  return ctx.report({ status: env.status, stdoutArtifactId: env.data.stdoutArtifactId });
+});`
+    );
+    try {
+      const summary = await new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true }).run(workflowPath);
+      expect(summary.status).toBe("completed");
+      const state = await FlowdexState.openRun(temp, summary.runId);
+      const artifacts = state.listArtifacts(summary.runId);
+      state.close();
+      const stdoutArtifact = artifacts.find((artifact) => artifact.id === (summary.report as { stdoutArtifactId: string }).stdoutArtifactId);
+      expect(stdoutArtifact).toBeDefined();
+      await expect(readFile(stdoutArtifact!.path, "utf8")).resolves.toBe("visible:\n");
+    } finally {
+      delete process.env.FLOWDEX_TEST_ENV;
+      delete process.env.FLOWDEX_TEST_HIDDEN;
+    }
   });
 
   it("runs ctx.integrate as a durable workflow operation", async () => {
@@ -235,6 +400,7 @@ export default workflow({
       { id: "second", phase: "review", mode: "read-only", prompt: "second" }
     ]
   });
+
   return ctx.report({ results });
 });`
     );
@@ -256,6 +422,25 @@ export default workflow({
     expect(completed.report).toEqual({
       results: [adapterResult("first"), adapterResult("second")]
     });
+  });
+
+  it("repairs completed single-agent rows that are missing the parent task result", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "a.txt"), "a\n");
+    const workflowPath = path.join(temp, "single-agent-repair.ts");
+    await writeFile(workflowPath, nativeSingleAgentWorkflow("single-agent-repair", "review"));
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const [dispatch] = state.leaseDispatches(summary.runId, 1);
+    state.completeAgentTask(summary.runId, dispatch!.childKey, dispatch!.leaseToken, adapterResult("reviewed"));
+    state.db.prepare("DELETE FROM task_results WHERE run_id = ? AND op_key = ?").run(summary.runId, dispatch!.childKey);
+    state.close();
+
+    const completed = await runtime.resume(summary.runId);
+
+    expect(completed.status).toBe("completed");
+    expect(completed.report).toEqual({ ok: true });
   });
 
   it("carries configured adapter model settings into native dispatches", async () => {
@@ -348,21 +533,23 @@ export default workflow({
     const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
     const summary = await runtime.run(workflowPath);
     const state = await FlowdexState.openRun(temp, summary.runId);
-    const [first] = state.leaseDispatches(summary.runId, 1);
-    expect(await readFile(path.join(first!.cwd, "src", "subject.txt"), "utf8")).toBe("first\n");
-    state.completeAgentTask(summary.runId, first!.childKey, first!.leaseToken, adapterResult("first"));
+    const [firstLease] = state.leaseDispatches(summary.runId, 1);
+    const first = await materializeDispatchSnapshot(state, summary.runId, firstLease!);
+    expect(await readFile(path.join(first.cwd, "src", "subject.txt"), "utf8")).toBe("first\n");
+    state.completeAgentTask(summary.runId, first.childKey, first.leaseToken, adapterResult("first"));
     state.close();
 
     await writeFile(path.join(temp, "src", "subject.txt"), "second\n");
     const secondSummary = await runtime.resume(summary.runId);
     expect(secondSummary.status).toBe("needs-dispatch");
     const secondState = await FlowdexState.openRun(temp, summary.runId);
-    const [second] = secondState.leaseDispatches(summary.runId, 1);
+    const [secondLease] = secondState.leaseDispatches(summary.runId, 1);
+    const second = await materializeDispatchSnapshot(secondState, summary.runId, secondLease!);
     secondState.close();
 
-    expect(second!.cwd).not.toBe(first!.cwd);
-    await expect(readFile(path.join(first!.cwd, "src", "subject.txt"), "utf8")).resolves.toBe("first\n");
-    await expect(readFile(path.join(second!.cwd, "src", "subject.txt"), "utf8")).resolves.toBe("second\n");
+    expect(second.cwd).not.toBe(first.cwd);
+    await expect(readFile(path.join(first.cwd, "src", "subject.txt"), "utf8")).resolves.toBe("first\n");
+    await expect(readFile(path.join(second.cwd, "src", "subject.txt"), "utf8")).resolves.toBe("second\n");
   });
 
   it("rebuilds restarted native task snapshots without stale files", async () => {
@@ -387,19 +574,21 @@ export default workflow({
     const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
     const summary = await runtime.run(workflowPath);
     const state = await FlowdexState.openRun(temp, summary.runId);
-    const [first] = state.leaseDispatches(summary.runId, 1);
-    expect(await readFile(path.join(first!.cwd, "src", "stale.txt"), "utf8")).toBe("stale\n");
+    const [firstLease] = state.leaseDispatches(summary.runId, 1);
+    const first = await materializeDispatchSnapshot(state, summary.runId, firstLease!);
+    expect(await readFile(path.join(first.cwd, "src", "stale.txt"), "utf8")).toBe("stale\n");
 
     await rm(path.join(temp, "src", "stale.txt"));
-    state.deleteTaskResult(summary.runId, first!.childKey);
+    state.deleteTaskResult(summary.runId, first.childKey);
     state.close();
 
     const resumed = await runtime.resume(summary.runId);
     expect(resumed.status).toBe("needs-dispatch");
     const restartedState = await FlowdexState.openRun(temp, summary.runId);
-    const [second] = restartedState.leaseDispatches(summary.runId, 1);
+    const [secondLease] = restartedState.leaseDispatches(summary.runId, 1);
+    const second = await materializeDispatchSnapshot(restartedState, summary.runId, secondLease!);
     restartedState.close();
-    await expect(readFile(path.join(second!.cwd, "src", "stale.txt"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(second.cwd, "src", "stale.txt"), "utf8")).rejects.toThrow();
   });
 
   it("accepts fileRange evidence from the native task snapshot", async () => {
@@ -434,7 +623,8 @@ export default workflow({
     expect(summary.status).toBe("needs-dispatch");
 
     const state = await FlowdexState.openRun(temp, summary.runId);
-    const [dispatch] = state.leaseDispatches(summary.runId, 1);
+    const [lease] = state.leaseDispatches(summary.runId, 1);
+    const dispatch = await materializeDispatchSnapshot(state, summary.runId, lease!);
     state.completeAgentTask(summary.runId, dispatch!.childKey, dispatch!.leaseToken, adapterResult("reviewed"));
     state.close();
 
@@ -445,6 +635,46 @@ export default workflow({
       claimIds: ["subject-reviewed"],
       claims: [{ id: "subject-reviewed" }]
     });
+  });
+
+  it("rejects fileRange evidence that points past the snapshotted file", async () => {
+    await mkdir(path.join(temp, "src"));
+    const source = "subject\n";
+    await writeFile(path.join(temp, "src", "subject.txt"), source);
+    const workflowPath = path.join(temp, "bad-file-evidence.ts");
+    await writeFile(
+      workflowPath,
+      `import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "bad-file-evidence",
+  maxAgents: 1,
+  maxConcurrency: 1,
+  defaultAdapter: "codex-native",
+  permissions: { read: ["src/**"], write: [], hostCommands: [], network: "none", env: { inherit: [] } },
+  phases: [{ id: "review", maxAgents: 1 }]
+}, async (ctx) => {
+  await ctx.agent({ id: "review", phase: "review", mode: "read-only", prompt: "review" });
+  ctx.claim({
+    id: "subject-reviewed",
+    text: "The subject file was reviewed.",
+    kind: "finding",
+    confidence: "high",
+    evidence: [{ type: "fileRange", path: "src/subject.txt", startLine: 2, endLine: 2, contentHash: "${sha256Bytes(source)}" }]
+  });
+  return ctx.report({ title: "File evidence", claimIds: ["subject-reviewed"] });
+});`
+    );
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const [lease] = state.leaseDispatches(summary.runId, 1);
+    const dispatch = await materializeDispatchSnapshot(state, summary.runId, lease!);
+    state.completeAgentTask(summary.runId, dispatch!.childKey, dispatch!.leaseToken, adapterResult("reviewed"));
+    state.close();
+
+    const completed = await runtime.resume(summary.runId);
+
+    expect(completed.status).toBe("failed");
   });
 });
 
@@ -505,6 +735,15 @@ function git(cwd: string, args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
   return result.stdout;
+}
+
+async function materializeDispatchSnapshot(state: FlowdexState, runId: string, dispatch: NativeDispatch): Promise<NativeDispatch> {
+  const snapshotRoot = path.join(temp, ".flowdex", "runs", runId, "snapshots", `${dispatch.childKey.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 72)}-${sha256Bytes(dispatch.childKey).slice(0, 16)}`);
+  await rm(snapshotRoot, { recursive: true, force: true });
+  const snapshot = await buildSnapshot({ root: temp, globs: ["src/**"], outDir: snapshotRoot });
+  await writeFile(path.join(snapshotRoot, ".flowdex-snapshot.json"), stableStringify(snapshot));
+  state.setAgentTaskContextCwd(runId, dispatch.childKey, snapshotRoot);
+  return { ...dispatch, cwd: snapshotRoot };
 }
 
 function adapterResult(value: string): AdapterResult {

@@ -1,16 +1,19 @@
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AdapterConfig, AdapterResult, AgentTask, CanonicalValue, ParsedWorkflow, RunStatus, ScheduledOperation, WorkflowManifest } from "../types.js";
 import { parseWorkflowSource } from "../policy/manifest.js";
 import { ArtifactStore } from "../store/artifacts.js";
 import { FlowdexState } from "../store/state.js";
 import { canonicalClone } from "../util/canonical.js";
-import { sha256Bytes, stableStringify } from "../util/hash.js";
+import { stableStringify } from "../util/hash.js";
 import { runHostCommand } from "./hostCommand.js";
 import { operationKey, runSandboxTick } from "./sandbox.js";
-import { buildSnapshot, type SnapshotManifest } from "./snapshot.js";
+import type { SnapshotManifest } from "./snapshot.js";
 import { filterReportableClaims } from "./evidence.js";
-import { applyPatch } from "./writeIntegration.js";
+import { applyPatches } from "./writeIntegration.js";
+import { formatPreview } from "./preview.js";
+
+export { formatPreview } from "./preview.js";
 
 const SNAPSHOT_MANIFEST_FILE = ".flowdex-snapshot.json";
 
@@ -91,6 +94,12 @@ export class FlowdexRuntime {
       if (currentStatus === "paused" || currentStatus === "stopped") {
         state.addEvent(runId, "workflow.suspended", { status: currentStatus });
         return { runId, status: currentStatus, parsed };
+      }
+      if (currentStatus === "completed") {
+        return { runId, status: "completed", report: state.getLatestCompletedReport(runId) as CanonicalValue | undefined, parsed };
+      }
+      if (currentStatus === "failed" || currentStatus === "failed-timeout") {
+        return { runId, status: "failed", parsed };
       }
       state.setRunStatus(runId, "running");
       return await this.driveRun(runId, runRoot, parsed, input, artifactStore, state);
@@ -177,7 +186,7 @@ export class FlowdexRuntime {
         state.saveTaskResult(runId, key, "completed", { status: "needs-approval", error: `host command not allowlisted: ${args.commandId ?? ""}` });
         return "completed";
       }
-      const result = await runHostCommand(spec, this.options.cwd, artifactStore);
+      const result = await runHostCommand(spec, this.options.cwd, artifactStore, manifest.permissions.env?.inherit ?? []);
       for (const artifact of result.artifacts) state.saveArtifact(runId, artifact);
       state.saveTaskResult(runId, key, "completed", { status: result.status, data: result.data });
       return "completed";
@@ -206,10 +215,14 @@ export class FlowdexRuntime {
     if (operation.kind === "integrate") {
       const args = operation.args as unknown as { patches?: Array<{ patch?: string }> };
       const patches = args.patches ?? [];
-      for (const patch of patches) {
-        if (!patch.patch) throw new Error("integrate patch entry is missing patch text");
-        applyPatch(this.options.cwd, patch.patch, manifest.permissions.write);
-      }
+      applyPatches(
+        this.options.cwd,
+        patches.map((patch) => {
+          if (!patch.patch) throw new Error("integrate patch entry is missing patch text");
+          return patch.patch;
+        }),
+        manifest.permissions.write
+      );
       state.saveTaskResult(runId, key, "completed", { status: "completed", applied: patches.length });
       return "completed";
     }
@@ -240,7 +253,10 @@ export class FlowdexRuntime {
       orderIndex,
       task: taskWithDispatchDefaults(task, adapterConfig, manifest)
     });
-    if (existing.result || existing.status === "completed" || existing.status === "failed" || existing.status === "blocked") return "completed";
+    if (existing.result || existing.status === "completed" || existing.status === "failed" || existing.status === "blocked") {
+      state.ensureSingleAgentTaskResult(runId, childKey);
+      return "completed";
+    }
     if (existing.status === "dispatchable" || existing.status === "leased" || existing.status === "dispatched") return "needs-dispatch";
     if (task.mode === "write") {
       const result = blockedResult(task, "codex-native write tasks are disabled; use read-only native workers and explicit ctx.integrate patches");
@@ -248,8 +264,7 @@ export class FlowdexRuntime {
       if (parentOpKey === childKey) state.saveTaskResult(runId, parentOpKey, "completed", result);
       return "completed";
     }
-    const contextCwd = await this.prepareTaskCwd(runId, runRoot, manifest, task, childKey);
-    state.markAgentDispatchable(runId, childKey, contextCwd);
+    state.markAgentDispatchable(runId, childKey);
     return "needs-dispatch";
   }
 
@@ -306,7 +321,11 @@ export class FlowdexRuntime {
     if (!Array.isArray(claimIds) || !claimIds.every((id) => typeof id === "string")) {
       throw new Error("report.claimIds must be an array of strings");
     }
-    const reportable = filterReportableClaims(claims, { snapshots: await readSnapshotManifests(runRoot), artifacts: state.listArtifacts(runId) });
+    const reportable = filterReportableClaims(claims, {
+      snapshots: await readSnapshotManifests(runRoot),
+      artifacts: state.listArtifacts(runId),
+      completedResults: state.getCompletedResults(runId)
+    });
     const byId = new Map(reportable.map((claim) => [claim.id, claim]));
     const selected = claimIds.map((id) => byId.get(id)).filter((claim): claim is import("../types.js").Claim => !!claim);
     if (selected.length !== claimIds.length) {
@@ -315,51 +334,11 @@ export class FlowdexRuntime {
     return canonicalClone({ ...(rawReport as Record<string, CanonicalValue>), claims: selected });
   }
 
-  private async prepareTaskCwd(runId: string, runRoot: string, manifest: WorkflowManifest, task: AgentTask, childKey: string): Promise<string> {
-    if (task.mode === "write") {
-      throw new Error("write-mode native tasks do not have an executable workspace");
-    }
-    const snapshotRoot = path.join(runRoot, "snapshots", collisionResistantSegment(childKey));
-    await rm(snapshotRoot, { recursive: true, force: true });
-    const snapshot = await buildSnapshot({
-      root: this.options.cwd,
-      globs: manifest.permissions.read,
-      outDir: snapshotRoot
-    });
-    await writeFile(path.join(snapshotRoot, SNAPSHOT_MANIFEST_FILE), stableStringify(snapshot));
-    return snapshotRoot;
-  }
 }
 
 export function createRunId(name: string): string {
   const safe = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "workflow";
   return `${new Date().toISOString().replace(/[:.]/g, "-")}-${safe}`;
-}
-
-function safePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 120) || "task";
-}
-
-function collisionResistantSegment(value: string): string {
-  const readable = safePathSegment(value).slice(0, 72);
-  return `${readable}-${sha256Bytes(value).slice(0, 16)}`;
-}
-
-export function formatPreview(parsed: ParsedWorkflow): string {
-  return [
-    `workflow: ${parsed.manifest.name}`,
-    `sourceHash: ${parsed.sourceHash}`,
-    `manifestHash: ${parsed.manifestHash}`,
-    `approvalHash: ${parsed.approvalHash}`,
-    `maxAgents: ${parsed.manifest.maxAgents}`,
-    `maxConcurrency: ${parsed.manifest.maxConcurrency}`,
-    `defaultAdapter: ${parsed.manifest.defaultAdapter ?? "codex-native"}`,
-    `network: ${parsed.manifest.permissions.network ?? "none"}`,
-    `read: ${parsed.manifest.permissions.read.join(", ")}`,
-    `write: ${parsed.manifest.permissions.write.join(", ")}`,
-    `phases: ${parsed.manifest.phases.map((phase) => `${phase.id}:${phase.maxAgents}`).join(", ")}`,
-    `manifest: ${stableStringify(parsed.manifest)}`
-  ].join("\n");
 }
 
 function fanoutChildKey(fanoutId: string, taskId: string): string {

@@ -1,9 +1,9 @@
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { validateAdapterResult } from "./adapterResult.js";
 import { FlowdexState } from "../store/state.js";
-import { nativeDispatchResultPath } from "./nativeDispatchFiles.js";
+import { nativeDispatchResultPath, nativeDispatchTaskDirectory } from "./nativeDispatchFiles.js";
 
-export type CollectResultStatus = "collected" | "missing" | "invalid" | "skipped";
+export type CollectResultStatus = "collected" | "missing" | "invalid" | "skipped" | "stale-result";
 
 export interface CollectResult {
   childKey: string;
@@ -44,6 +44,21 @@ export async function collectNativeResultFiles(cwd: string, runId: string, state
     try {
       await stat(resultPath);
     } catch {
+      const staleResultPath = await findStaleResultPath(runRoot, task.childKey, task.leaseToken);
+      if (staleResultPath) {
+        const error = "adapter-result.json exists for an older lease token";
+        state.recordAgentTaskCollectionError(runId, task.childKey, error);
+        results.push({
+          childKey: task.childKey,
+          taskId: task.taskId,
+          status: "stale-result",
+          taskStatus: task.status,
+          resultPath: staleResultPath,
+          error
+        });
+        continue;
+      }
+      state.recordAgentTaskCollectionError(runId, task.childKey, "adapter-result.json not found");
       results.push({
         childKey: task.childKey,
         taskId: task.taskId,
@@ -66,6 +81,7 @@ export async function collectNativeResultFiles(cwd: string, runId: string, state
         adapterStatus: result.status
       });
     } catch (error) {
+      state.recordAgentTaskCollectionError(runId, task.childKey, error instanceof Error ? error.message : String(error));
       results.push({
         childKey: task.childKey,
         taskId: task.taskId,
@@ -77,4 +93,22 @@ export async function collectNativeResultFiles(cwd: string, runId: string, state
     }
   }
   return results;
+}
+
+async function findStaleResultPath(runRoot: string, childKey: string, currentLeaseToken: string | undefined): Promise<string | undefined> {
+  const taskDirectory = nativeDispatchTaskDirectory(runRoot, childKey);
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await readdir(taskDirectory, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === currentLeaseToken) continue;
+    const candidate = nativeDispatchResultPath(runRoot, childKey, entry.name);
+    try {
+      if ((await stat(candidate)).isFile()) return candidate;
+    } catch {}
+  }
+  return undefined;
 }

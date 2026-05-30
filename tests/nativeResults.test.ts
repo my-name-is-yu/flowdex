@@ -94,6 +94,70 @@ describe("native result collection", () => {
     expect(results[0]?.error).toMatch(/unexpected adapter result field/);
     state.close();
   });
+
+  it("rejects AdapterResult files with malformed nested claims", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "a.txt"), "a\n");
+    const workflowPath = await writeFanoutWorkflow(1);
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const [dispatch] = state.leaseDispatches(summary.runId, 1);
+    const filePackage = await writeNativeDispatchFilePackage(FlowdexState.runDirectory(temp, summary.runId), dispatch!);
+    await writeFile(filePackage.resultPath, JSON.stringify({ ...adapterResult("first"), claims: [{ id: "bad" }] }));
+
+    const results = await collectNativeResultFiles(temp, summary.runId, state);
+
+    expect(results.map((result) => result.status)).toEqual(["invalid"]);
+    expect(results[0]?.error).toMatch(/adapter claim/);
+    state.close();
+  });
+
+  it("stores native claims as untrusted data instead of verified AdapterResult claims", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "a.txt"), "a\n");
+    const workflowPath = await writeFanoutWorkflow(1);
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const [dispatch] = state.leaseDispatches(summary.runId, 1);
+    const filePackage = await writeNativeDispatchFilePackage(FlowdexState.runDirectory(temp, summary.runId), dispatch!);
+    await writeFile(
+      filePackage.resultPath,
+      JSON.stringify({
+        ...adapterResult("first"),
+        claims: [{ id: "native-finding", text: "native", kind: "finding", confidence: "medium", evidence: [] }]
+      })
+    );
+
+    const results = await collectNativeResultFiles(temp, summary.runId, state);
+    const task = state.getAgentTask(summary.runId, dispatch!.childKey);
+
+    expect(results.map((result) => result.status)).toEqual(["collected"]);
+    expect(task?.result?.claims).toEqual([]);
+    expect((task?.result?.data as { flowdexUntrustedClaims?: unknown[] }).flowdexUntrustedClaims?.[0]).toMatchObject({ id: "native-finding" });
+    state.close();
+  });
+
+  it("reports stale result files from expired previous leases", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "a.txt"), "a\n");
+    const workflowPath = await writeFanoutWorkflow(1);
+    const runtime = new FlowdexRuntime({ cwd: temp, maxTicks: 4, autoApprove: true });
+    const summary = await runtime.run(workflowPath);
+    const state = await FlowdexState.openRun(temp, summary.runId);
+    const [firstLease] = state.leaseDispatches(summary.runId, 1, 1);
+    const firstPackage = await writeNativeDispatchFilePackage(FlowdexState.runDirectory(temp, summary.runId), firstLease!);
+    await writeFile(firstPackage.resultPath, JSON.stringify(adapterResult("late")));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    state.leaseDispatches(summary.runId, 1, 30_000);
+
+    const results = await collectNativeResultFiles(temp, summary.runId, state);
+
+    expect(results).toMatchObject([{ status: "stale-result", error: expect.stringContaining("older lease") }]);
+    expect(state.getAgentTask(summary.runId, firstLease!.childKey)?.error).toContain("older lease");
+    state.close();
+  });
 });
 
 async function writeFanoutWorkflow(taskCount: number): Promise<string> {

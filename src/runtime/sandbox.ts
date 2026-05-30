@@ -160,10 +160,6 @@ const ctx = Object.freeze({
     __ensureNotSuspended();
     __staged.claims.push(__canonical(claim));
   },
-  artifact: (artifact) => {
-    __ensureNotSuspended();
-    __staged.artifacts.push(__canonical(artifact));
-  },
   report: (report) => {
     __ensureNotSuspended();
     const canonicalReport = __canonical(report);

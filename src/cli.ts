@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 import { constants } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { FlowdexRuntime, formatPreview } from "./runtime/runtime.js";
-import { FlowdexState } from "./store/state.js";
 import { validateAdapterResult } from "./runtime/adapterResult.js";
 import { templateFor } from "./runtime/templates.js";
-import { writeNativeDispatchFilePackage } from "./runtime/nativeDispatchFiles.js";
-import { collectNativeResultFiles } from "./runtime/nativeResults.js";
+import { nativeDispatchResultPath, writeNativeDispatchFilePackage } from "./runtime/nativeDispatchFiles.js";
 import { readReportPath } from "./runtime/reportPath.js";
-import type { AgentTaskRecord, CanonicalValue } from "./types.js";
+import type { AgentTaskRecord, CanonicalValue, NativeDispatch } from "./types.js";
+import type { NativeDispatchFilePackage } from "./runtime/nativeDispatchFiles.js";
+import type { WorkflowManifest } from "./types.js";
+import { sha256Bytes, stableStringify } from "./util/hash.js";
 
 const CODEX_DESKTOP_ACTIVE_AGENT_LIMIT = 6;
+const SNAPSHOT_MANIFEST_FILE = ".flowdex-snapshot.json";
 
 interface CommandContext {
   command: string;
@@ -38,6 +39,7 @@ const COMMANDS: Record<string, CommandHandler> = {
   status: statusCommand,
   pause: lifecycleCommand,
   stop: lifecycleCommand,
+  "repair-events": repairEventsCommand,
   "restart-agent": restartAgentCommand,
   save: saveCommand,
   workflow: workflowCommand,
@@ -59,13 +61,15 @@ async function main(argv: string[]): Promise<void> {
 
 async function previewCommand({ cwd, target }: CommandContext): Promise<void> {
   if (!target) throw new Error("flowdex preview requires a workflow path");
-  const runtime = new FlowdexRuntime({ cwd });
-  const parsed = await runtime.preview(await resolveWorkflowPath(cwd, target));
+  const [{ parseWorkflowSource }, { formatPreview }] = await Promise.all([import("./policy/manifest.js"), import("./runtime/preview.js")]);
+  const workflowPath = await resolveWorkflowPath(cwd, target);
+  const parsed = parseWorkflowSource(await readFile(workflowPath, "utf8"), workflowPath);
   process.stdout.write(`${formatPreview(parsed)}\n`);
 }
 
 async function runCommand({ cwd, target, rest }: CommandContext): Promise<void> {
   if (!target) throw new Error("flowdex run requires a workflow path");
+  const { FlowdexRuntime } = await import("./runtime/runtime.js");
   const inputFlag = rest.findIndex((item) => item === "--input");
   const input = inputFlag >= 0 && rest[inputFlag + 1] ? JSON.parse(await readInput(rest[inputFlag + 1]!)) : {};
   const runIdFlag = rest.findIndex((item) => item === "--run-id");
@@ -81,6 +85,7 @@ async function runCommand({ cwd, target, rest }: CommandContext): Promise<void> 
 }
 
 async function listCommand({ cwd }: CommandContext): Promise<void> {
+  const { FlowdexState } = await import("./store/state.js");
   const runIds = await FlowdexState.listRunIds(cwd);
   for (const runId of runIds) {
     const state = await FlowdexState.openExistingRun(cwd, runId);
@@ -96,6 +101,7 @@ async function listCommand({ cwd }: CommandContext): Promise<void> {
 
 async function resumeCommand({ command, cwd, target }: CommandContext): Promise<void> {
   if (!target) throw new Error(`flowdex ${command} requires a run id`);
+  const { FlowdexRuntime } = await import("./runtime/runtime.js");
   const runtime = new FlowdexRuntime({ cwd, autoApprove: true });
   const summary = await runtime.resume(target);
   writeRunSummary(summary);
@@ -120,20 +126,73 @@ async function nextCommand({ cwd, target, rest }: CommandContext): Promise<void>
   const state = await openExistingState(cwd, target);
   const dispatches = state.leaseDispatches(target, Number.isFinite(limit) && limit > 0 ? limit : CODEX_DESKTOP_ACTIVE_AGENT_LIMIT);
   state.close();
-  const output = rest.includes("--files")
-    ? await Promise.all(dispatches.map((dispatch) => writeNativeDispatchFilePackage(path.join(cwd, ".flowdex", "runs", target), dispatch)))
-    : dispatches;
+  const { FlowdexState } = await import("./store/state.js");
+  const runRoot = FlowdexState.runDirectory(cwd, target);
+  const materialized: NativeDispatch[] = [];
+  for (const dispatch of dispatches) {
+    try {
+      materialized.push(await materializeDispatchSnapshot(cwd, target, runRoot, dispatch));
+    } catch (error) {
+      const releaseState = await openExistingState(cwd, target);
+      try {
+        releaseState.releaseLease(target, dispatch.childKey, dispatch.leaseToken, error instanceof Error ? error.message : String(error));
+      } finally {
+        releaseState.close();
+      }
+      throw error;
+    }
+  }
+  const output: Array<NativeDispatch | NativeDispatchFilePackage> = rest.includes("--files") ? [] : materialized;
+  if (rest.includes("--files")) {
+    for (const dispatch of materialized) {
+      try {
+        output.push(await writeNativeDispatchFilePackage(runRoot, dispatch));
+      } catch (error) {
+        const releaseState = await openExistingState(cwd, target);
+        try {
+          releaseState.releaseLease(target, dispatch.childKey, dispatch.leaseToken, error instanceof Error ? error.message : String(error));
+        } finally {
+          releaseState.close();
+        }
+        throw error;
+      }
+    }
+  }
   if (rest.includes("--json")) {
     process.stdout.write(JSON.stringify(output, null, 2));
     process.stdout.write("\n");
     return;
   }
   for (const item of output) {
+    const filePackage = item as NativeDispatchFilePackage;
     process.stdout.write(
       "instructionPath" in item
-        ? `${item.childKey}\t${item.phase}\t${item.mode}\t${item.cwd}\t${item.instructionPath}\t${item.resultPath}\n`
+        ? `${filePackage.childKey}\t${filePackage.phase}\t${filePackage.mode}\t${filePackage.cwd}\t${filePackage.instructionPath}\t${filePackage.resultPath}\n`
         : `${item.childKey}\t${item.phase}\t${item.mode}\t${item.cwd}\n`
     );
+  }
+}
+
+async function materializeDispatchSnapshot(cwd: string, runId: string, runRoot: string, dispatch: NativeDispatch): Promise<NativeDispatch> {
+  if (dispatch.cwd) return dispatch;
+  const state = await openExistingState(cwd, runId);
+  try {
+    const run = state.getRun(runId);
+    if (!run) throw new Error(`unknown Flowdex run: ${runId}`);
+    const manifest = JSON.parse(String(run.manifest_json)) as WorkflowManifest;
+    const snapshotRoot = path.join(runRoot, "snapshots", collisionResistantSegment(dispatch.childKey));
+    await rm(snapshotRoot, { recursive: true, force: true });
+    const { buildSnapshot } = await import("./runtime/snapshot.js");
+    const snapshot = await buildSnapshot({
+      root: cwd,
+      globs: manifest.permissions.read,
+      outDir: snapshotRoot
+    });
+    await writeFile(path.join(snapshotRoot, SNAPSHOT_MANIFEST_FILE), stableStringify(snapshot));
+    state.setAgentTaskContextCwd(runId, dispatch.childKey, snapshotRoot);
+    return { ...dispatch, cwd: snapshotRoot };
+  } finally {
+    state.close();
   }
 }
 
@@ -162,11 +221,13 @@ async function completeAgentCommand({ cwd, target, rest }: CommandContext): Prom
 
 async function collectResultsCommand({ cwd, target, rest }: CommandContext): Promise<void> {
   if (!target) throw new Error("flowdex collect-results requires a run id");
+  const { collectNativeResultFiles } = await import("./runtime/nativeResults.js");
   const state = await openExistingState(cwd, target);
   const results = await collectNativeResultFiles(cwd, target, state);
   state.close();
   let continued: { runId: string; status: string; report: CanonicalValue | null } | undefined;
   if (rest.includes("--continue")) {
+    const { FlowdexRuntime } = await import("./runtime/runtime.js");
     const runtime = new FlowdexRuntime({ cwd, autoApprove: true });
     const summary = await runtime.resume(target);
     continued = { runId: summary.runId, status: summary.status, report: summary.report ?? null };
@@ -187,6 +248,11 @@ async function reportCommand({ cwd, target, rest }: CommandContext): Promise<voi
   const state = await openExistingState(cwd, target);
   const report = state.getLatestCompletedReport(target);
   state.close();
+  if (rest.includes("--paths")) {
+    process.stdout.write(JSON.stringify(listReportPaths(report), null, 2));
+    process.stdout.write("\n");
+    return;
+  }
   const pathExpression = readFlag(rest, "--path");
   const value = pathExpression ? readReportPath(report, pathExpression) : (report ?? null);
   if (rest.includes("--raw") && typeof value === "string") {
@@ -212,7 +278,7 @@ async function statusCommand({ cwd, target, rest }: CommandContext): Promise<voi
   const { run, tasks } = state.getRunSummary(target);
   state.close();
   if (rest.includes("--json")) {
-    const outputTasks = rest.includes("--compact") ? tasks.map(compactStatusTask) : tasks;
+    const outputTasks = rest.includes("--compact") ? tasks.map((task) => compactStatusTask(cwd, target, task)) : tasks;
     process.stdout.write(JSON.stringify({ runId: target, run, counts: countTasks(tasks), tasks: outputTasks }, null, 2));
     process.stdout.write("\n");
     return;
@@ -225,7 +291,7 @@ async function lifecycleCommand({ command, cwd, target }: CommandContext): Promi
   const state = await openExistingState(cwd, target);
   const run = state.getRun(target);
   state.setRunStatus(target, command === "pause" ? "paused" : "stopped");
-  if (command === "stop" && typeof run?.pid === "number") {
+  if (command === "stop" && typeof run?.pid === "number" && isFreshHeartbeat(run.heartbeat_at)) {
     try {
       process.kill(-run.pid, "SIGTERM");
     } catch {
@@ -240,11 +306,20 @@ async function lifecycleCommand({ command, cwd, target }: CommandContext): Promi
   process.stdout.write(`${target}\t${command === "pause" ? "paused" : "stopped"}\n`);
 }
 
+async function repairEventsCommand({ cwd, target }: CommandContext): Promise<void> {
+  if (!target) throw new Error("flowdex repair-events requires a run id");
+  const state = await openExistingState(cwd, target);
+  const count = state.rebuildEventProjection(target);
+  state.close();
+  process.stdout.write(`${target}\trebuilt events.jsonl\t${count}\n`);
+}
+
 async function restartAgentCommand({ cwd, target, rest }: CommandContext): Promise<void> {
   if (!target || !rest[0]) throw new Error("flowdex restart-agent requires a run id and op key");
   const state = await openExistingState(cwd, target);
   state.deleteTaskResult(target, rest[0]);
   state.close();
+  const { FlowdexRuntime } = await import("./runtime/runtime.js");
   const runtime = new FlowdexRuntime({ cwd, autoApprove: true });
   const summary = await runtime.resume(target);
   process.stdout.write(`${target}\tinvalidated ${rest[0]}\t${summary.status}\n`);
@@ -253,6 +328,7 @@ async function restartAgentCommand({ cwd, target, rest }: CommandContext): Promi
 async function saveCommand({ cwd, target, rest }: CommandContext): Promise<void> {
   if (!target || !rest[0]) throw new Error("flowdex save requires a run id and workflow name");
   if (!isSafeWorkflowName(rest[0])) throw new Error("flowdex save workflow name must be a safe id");
+  const { FlowdexState } = await import("./store/state.js");
   const runWorkflow = path.join(FlowdexState.runDirectory(cwd, target), "workflow.ts");
   const destination = path.join(cwd, ".flowdex", "workflows", `${rest[0]}.ts`);
   const { mkdir, copyFile } = await import("node:fs/promises");
@@ -301,7 +377,8 @@ async function readInput(value: string): Promise<string> {
   return value;
 }
 
-async function openExistingState(cwd: string, runId: string): Promise<FlowdexState> {
+async function openExistingState(cwd: string, runId: string): Promise<import("./store/state.js").FlowdexState> {
+  const { FlowdexState } = await import("./store/state.js");
   const state = await FlowdexState.openExistingRun(cwd, runId);
   if (!state) throw new Error(`unknown Flowdex run: ${runId}`);
   return state;
@@ -335,7 +412,7 @@ Usage:
   flowdex resume <run-id>
   flowdex continue <run-id>
   flowdex inspect <run-id>
-  flowdex report <run-id> [--path json.path] [--raw]
+  flowdex report <run-id> [--path json.path] [--raw] [--paths]
   flowdex next <run-id> --json [--files] [--limit N]
   flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>
   flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file
@@ -344,10 +421,22 @@ Usage:
   flowdex watch <run-id>
   flowdex pause <run-id>
   flowdex stop <run-id>
+  flowdex repair-events <run-id>
   flowdex restart-agent <run-id> <op-key>
   flowdex save <run-id> <name>
   flowdex workflow list
 `);
+}
+
+function isFreshHeartbeat(value: unknown, maxAgeMs = 60_000): boolean {
+  if (typeof value !== "string") return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && Date.now() - time <= maxAgeMs;
+}
+
+function collisionResistantSegment(value: string): string {
+  const readable = value.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 72) || "task";
+  return `${readable}-${sha256Bytes(value).slice(0, 16)}`;
 }
 
 function countTasks(tasks: AgentTaskRecord[]): Record<string, number> {
@@ -356,7 +445,8 @@ function countTasks(tasks: AgentTaskRecord[]): Record<string, number> {
   return counts;
 }
 
-function compactStatusTask(task: AgentTaskRecord): Record<string, unknown> {
+function compactStatusTask(cwd: string, runId: string, task: AgentTaskRecord): Record<string, unknown> {
+  const runRoot = path.join(cwd, ".flowdex", "runs", runId);
   return {
     childKey: task.childKey,
     taskId: task.taskId,
@@ -368,10 +458,26 @@ function compactStatusTask(task: AgentTaskRecord): Record<string, unknown> {
     leaseToken: task.leaseToken,
     leaseExpiresAt: task.leaseExpiresAt,
     agentRef: task.agentRef,
+    resultPath: task.leaseToken ? nativeDispatchResultPath(runRoot, task.childKey, task.leaseToken) : undefined,
     adapterStatus: task.result?.status,
     summary: task.result?.summary,
     error: task.error ?? task.result?.error
   };
+}
+
+function listReportPaths(value: unknown, prefix = ""): string[] {
+  if (value === null || value === undefined || typeof value !== "object") return prefix ? [prefix] : [];
+  if (Array.isArray(value)) {
+    const paths = prefix ? [prefix] : [];
+    value.forEach((item, index) => paths.push(...listReportPaths(item, prefix ? `${prefix}.${index}` : String(index))));
+    return paths;
+  }
+  const paths = prefix ? [prefix] : [];
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    const escaped = key.includes(".") ? JSON.stringify(key) : key;
+    paths.push(...listReportPaths((value as Record<string, unknown>)[key], prefix ? `${prefix}.${escaped}` : escaped));
+  }
+  return paths;
 }
 
 function formatWatch(runId: string, run: Record<string, unknown> | undefined, tasks: AgentTaskRecord[]): string {

@@ -32,6 +32,7 @@ export interface HostCommandSpec {
   argv: string[];
   cwd: "project";
   timeoutMs?: number;
+  maxOutputBytes?: number;
 }
 
 export interface WorkflowPhase {

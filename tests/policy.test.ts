@@ -79,7 +79,8 @@ export default workflow({
     ["non-string read permission", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [1], write: [], hostCommands: [], network: \"none\", env: { inherit: [] } }"],
     ["bad env inherit", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [\"src/**\"], write: [], hostCommands: [], network: \"none\", env: { inherit: [1] } }"],
     ["bad host command cwd", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [\"src/**\"], write: [], hostCommands: [{ id: \"unit\", argv: [\"node\"], cwd: \"snapshot\" }], network: \"none\", env: { inherit: [] } }"],
-    ["empty host command argv", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [\"src/**\"], write: [], hostCommands: [{ id: \"unit\", argv: [], cwd: \"project\" }], network: \"none\", env: { inherit: [] } }"]
+    ["empty host command argv", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [\"src/**\"], write: [], hostCommands: [{ id: \"unit\", argv: [], cwd: \"project\" }], network: \"none\", env: { inherit: [] } }"],
+    ["bad host command output cap", "maxAgents: 4, maxConcurrency: 2, permissions: { read: [\"src/**\"], write: [], hostCommands: [{ id: \"unit\", argv: [\"node\"], cwd: \"project\", maxOutputBytes: 0 }], network: \"none\", env: { inherit: [] } }"]
   ])("rejects %s", (_name, limits) => {
     expect(() =>
       parseWorkflowSource(
@@ -112,6 +113,7 @@ export default workflow({
     ["destructuring default durable call", "const { x = ctx.agent({ id: 'a', phase: 'test', mode: 'read-only', prompt: 'a' }) } = {}; return ctx.report({ x });"],
     ["ctx method alias", "const dispatch = { map: ctx.agent }; dispatch.map({ id: 'a', phase: 'test', mode: 'read-only', prompt: 'a' }); return ctx.report({ ok: true });"],
     ["ctx side effect callback alias", "const items = [1]; items.map(ctx.report); return ctx.report({ ok: true });"],
+    ["unsupported ctx artifact", "ctx.artifact({ name: 'raw', mediaType: 'application/json', value: {} }); return ctx.report({ ok: true });"],
     ["builtin callback alias", "const xs = [1].map(Math.random); return ctx.report({ xs });"],
     ["ctx reassignment", "ctx = { agent: JSON.stringify, report: JSON.parse }; const x = await ctx.agent({ id: 'a', phase: 'test', mode: 'read-only', prompt: 'a' }); return ctx.report({ x });"],
     ["ctx parameter shadow", "const xs = [1].map((ctx) => ctx); return ctx.report({ xs });"],

@@ -188,6 +188,9 @@ function validateHostCommand(command: unknown, seen: Set<string>): void {
   if (spec.timeoutMs !== undefined && (!Number.isInteger(spec.timeoutMs) || spec.timeoutMs <= 0)) {
     throw new ManifestError(`host command timeoutMs must be a positive integer: ${spec.id}`);
   }
+  if (spec.maxOutputBytes !== undefined && (!Number.isInteger(spec.maxOutputBytes) || spec.maxOutputBytes <= 0)) {
+    throw new ManifestError(`host command maxOutputBytes must be a positive integer: ${spec.id}`);
+  }
 }
 
 function validateAdapters(manifest: WorkflowManifest): void {

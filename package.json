@@ -1,5 +1,5 @@
 {
-  "name": "flowdex",
+  "name": "@flowdex/runtime",
   "version": "0.1.0",
   "description": "Runtime-backed workflow orchestration for Codex-style sub-agent fanout",
   "type": "module",
@@ -16,6 +16,20 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime/runtime.d.ts",
+      "import": "./dist/runtime/runtime.js"
+    },
+    "./state": {
+      "types": "./dist/store/state.d.ts",
+      "import": "./dist/store/state.js"
+    }
+  },
   "files": [
     "dist",
     "skills",

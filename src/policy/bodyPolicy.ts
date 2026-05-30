@@ -28,13 +28,12 @@ const allowedCtxCalls = new Set([
   "hostCommand",
   "integrate",
   "claim",
-  "artifact",
   "report",
   "now",
   "isFlowdexPending"
 ]);
 const durableCalls = new Set(["agent", "fanout", "hostCommand", "integrate"]);
-const sideEffectCalls = new Set(["claim", "artifact", "report"]);
+const sideEffectCalls = new Set(["claim", "report"]);
 const allowedJsonCalls = new Set(["stringify", "parse"]);
 const allowedObjectCalls = new Set(["keys", "values", "entries"]);
 const allowedArrayCalls = new Set(["isArray"]);

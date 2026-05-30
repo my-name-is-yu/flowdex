@@ -13,7 +13,7 @@ export default workflow({
   maxAgents: 8,
   maxConcurrency: 4,
   permissions: {
-    read: ["**"],
+    read: ["src/**", "tests/**", "examples/**", "skills/**", "README.md", "package.json"],
     write: [],
     hostCommands: [],
     network: "none",
@@ -59,7 +59,7 @@ function parallelReviewTemplate(): string {
 }
 
 function implementationFanoutTemplate(): string {
-  return `${header("implementation-fanout").replace("write: [],", "write: [\"**\"],")}
+  return `${header("implementation-fanout")}
   const plans = await ctx.fanout({
     id: "implementation-slices",
     phase: "review",

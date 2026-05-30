@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { applyPatch } from "../src/runtime/writeIntegration.js";
+import { applyPatch, applyPatches } from "../src/runtime/writeIntegration.js";
 
 let repo: string;
 
@@ -38,6 +38,15 @@ describe("explicit patch integration", () => {
     git(["checkout", "--", "a.txt"]);
 
     expect(() => applyPatch(repo, patch, ["src/**"])).toThrow(/outside manifest\.permissions\.write/);
+  });
+
+  it("preflights combined patches before mutating the worktree", async () => {
+    await writeFile(path.join(repo, "a.txt"), "after\n");
+    const firstPatch = git(["diff"]);
+    git(["checkout", "--", "a.txt"]);
+    const invalidPatch = firstPatch.replace("-before", "-not-before");
+    expect(() => applyPatches(repo, [firstPatch, invalidPatch], ["**"])).toThrow();
+    await expect(readFile(path.join(repo, "a.txt"), "utf8")).resolves.toBe("before\n");
   });
 });
 

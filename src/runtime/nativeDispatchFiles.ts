@@ -57,7 +57,11 @@ export async function writeNativeDispatchFilePackage(runRoot: string, dispatch: 
 }
 
 export function nativeDispatchDirectory(runRoot: string, childKey: string, leaseToken: string): string {
-  return path.join(runRoot, "dispatches", safePathSegment(childKey), safePathSegment(leaseToken));
+  return path.join(nativeDispatchTaskDirectory(runRoot, childKey), safePathSegment(leaseToken));
+}
+
+export function nativeDispatchTaskDirectory(runRoot: string, childKey: string): string {
+  return path.join(runRoot, "dispatches", safePathSegment(childKey));
 }
 
 export function nativeDispatchResultPath(runRoot: string, childKey: string, leaseToken: string): string {
@@ -73,8 +77,19 @@ function buildNativeDispatchInstructions(dispatch: NativeDispatch, taskPath: str
     `- ${taskPath}`,
     "",
     "Use the package fields as authoritative, especially `cwd`, `prompt`, and optional `data`.",
+    "",
+    `Child key: ${dispatch.childKey}`,
+    `Task id: ${dispatch.taskId}`,
+    `Role: ${dispatch.role ?? "unspecified"}`,
+    `Mode: ${dispatch.mode}`,
     `Work in the package \`cwd\`: ${dispatch.cwd}`,
     `Network policy for this task: ${dispatch.network ?? "none"}.`,
+    "",
+    "Prompt:",
+    "",
+    dispatch.prompt,
+    "",
+    `Optional data keys: ${dispatch.data && typeof dispatch.data === "object" && !Array.isArray(dispatch.data) ? Object.keys(dispatch.data).join(", ") || "(none)" : "(none)"}`,
     "",
     "Do only that assigned task. Do not orchestrate unrelated work or spawn other agents.",
     "",

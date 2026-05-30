@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +18,13 @@ afterEach(async () => {
 });
 
 describe("Flowdex CLI native bridge", () => {
+  it("prints help without loading SQLite-backed runtime state", () => {
+    const result = spawnSync(process.execPath, [cliPath, "--help"], { cwd: temp, encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("flowdex preview <workflow.ts>");
+  });
+
   it("runs the file-based native dispatch lifecycle", async () => {
     await mkdir(path.join(temp, "src"));
     await writeFile(path.join(temp, "src", "subject.txt"), "subject\n");
@@ -55,9 +62,11 @@ describe("Flowdex CLI native bridge", () => {
     const started = runJson(["run", workflowPath, "--yes"]) as { runId: string; status: string };
     expect(started.status).toBe("needs-dispatch");
     const runId = String(started.runId);
+    expect(await snapshotDirectoryCount(runId)).toBe(0);
 
     const firstBatch = runJson(["next", runId, "--json", "--files"]) as Array<Record<string, string>>;
     expect(firstBatch.map((dispatch) => dispatch.taskId)).toEqual(["task-1", "task-2", "task-3", "task-4", "task-5", "task-6"]);
+    expect(await snapshotDirectoryCount(runId)).toBe(6);
     expect(runJson(["next", runId, "--json", "--files"])).toEqual([]);
 
     for (const dispatch of firstBatch) {
@@ -71,6 +80,7 @@ describe("Flowdex CLI native bridge", () => {
 
     const secondBatch = runJson(["next", runId, "--json", "--files"]) as Array<Record<string, string>>;
     expect(secondBatch.map((dispatch) => dispatch.taskId)).toEqual(["task-7", "task-8"]);
+    expect(await snapshotDirectoryCount(runId)).toBe(8);
     for (const dispatch of secondBatch) {
       await writeFile(dispatch.resultPath, JSON.stringify(adapterResult(dispatch.taskId)));
     }
@@ -236,10 +246,43 @@ describe("Flowdex CLI native bridge", () => {
     expect(before.counts.dispatchable).toBe(1);
 
     runJson(["next", runId, "--json", "--files"]);
-    const afterLease = runJson(["status", runId, "--json", "--compact"]) as { counts: Record<string, number>; tasks: Array<{ status: string }> };
+    const afterLease = runJson(["status", runId, "--json", "--compact"]) as { counts: Record<string, number>; tasks: Array<{ status: string; resultPath?: string }> };
     expect(afterLease.counts.leased).toBe(1);
     expect(afterLease.tasks[0]?.status).toBe("leased");
+    expect(afterLease.tasks[0]?.resultPath).toContain("adapter-result.json");
     expect(runText(["watch", runId])).toContain("agents: total=1");
+  }, CLI_TEST_TIMEOUT_MS);
+
+  it("lists report paths for completed reports", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "subject.txt"), "subject\n");
+    const workflowPath = path.join(temp, "workflow.ts");
+    await writeFile(workflowPath, workflowSource());
+    const started = runJson(["run", workflowPath, "--yes"]) as { runId: string; status: string };
+    const runId = String(started.runId);
+    const [dispatch] = runJson(["next", runId, "--json", "--files"]) as Array<Record<string, string>>;
+    await writeFile(dispatch!.resultPath, JSON.stringify(adapterResult("reviewed")));
+    runJson(["collect-results", runId, "--continue", "--json"]);
+
+    const paths = runJson(["report", runId, "--paths"]) as string[];
+
+    expect(paths).toContain("result.summary");
+    expect(paths).toContain("result.data.value");
+  }, CLI_TEST_TIMEOUT_MS);
+
+  it("rebuilds the events.jsonl projection from SQLite", async () => {
+    await mkdir(path.join(temp, "src"));
+    await writeFile(path.join(temp, "src", "subject.txt"), "subject\n");
+    const workflowPath = path.join(temp, "workflow.ts");
+    await writeFile(workflowPath, workflowSource());
+    const started = runJson(["run", workflowPath, "--yes"]) as { runId: string; status: string };
+    const eventsPath = path.join(temp, ".flowdex", "runs", String(started.runId), "events.jsonl");
+    await writeFile(eventsPath, "stale\n");
+
+    const output = runText(["repair-events", String(started.runId)]);
+
+    expect(output).toContain("rebuilt events.jsonl");
+    await expect(readFile(eventsPath, "utf8")).resolves.toContain("run.created");
   }, CLI_TEST_TIMEOUT_MS);
 });
 
@@ -300,4 +343,13 @@ function adapterResult(value: string): AdapterResult {
     usage: {},
     error: null
   };
+}
+
+async function snapshotDirectoryCount(runId: string): Promise<number> {
+  try {
+    const entries = await readdir(path.join(temp, ".flowdex", "runs", runId, "snapshots"), { withFileTypes: true });
+    return entries.filter((entry) => entry.isDirectory()).length;
+  } catch {
+    return 0;
+  }
 }

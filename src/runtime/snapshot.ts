@@ -8,6 +8,7 @@ export interface SnapshotFile {
   sha256: string;
   sourceKind: "file";
   size: number;
+  lineCount: number;
 }
 
 export interface SnapshotManifest {
@@ -63,12 +64,12 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<SnapshotM
       }
       await materialize(options.outDir, relative, absolutePath);
       const sha256 = sha256Bytes(retryContent);
-      files.push({ path: relative, mode: retryAfter.mode, sha256, sourceKind: "file", size: retryContent.length });
+      files.push({ path: relative, mode: retryAfter.mode, sha256, sourceKind: "file", size: retryContent.length, lineCount: countLines(retryContent) });
       totalBytes += retryContent.length;
     } else {
       await materialize(options.outDir, relative, absolutePath);
       const sha256 = sha256Bytes(content);
-      files.push({ path: relative, mode: after.mode, sha256, sourceKind: "file", size: content.length });
+      files.push({ path: relative, mode: after.mode, sha256, sourceKind: "file", size: content.length, lineCount: countLines(content) });
       totalBytes += content.length;
     }
 
@@ -80,8 +81,17 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<SnapshotM
   return {
     root: options.outDir,
     files,
-    hash: sha256Bytes(JSON.stringify(files.map((file) => [file.path, file.mode, file.sha256, file.size])))
+    hash: sha256Bytes(JSON.stringify(files.map((file) => [file.path, file.mode, file.sha256, file.size, file.lineCount])))
   };
+}
+
+function countLines(content: Buffer): number {
+  if (content.length === 0) return 0;
+  let lines = 1;
+  for (const byte of content) {
+    if (byte === 10) lines++;
+  }
+  return content.at(-1) === 10 ? lines - 1 : lines;
 }
 
 async function* walk(directory: string): AsyncGenerator<string> {

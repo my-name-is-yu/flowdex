@@ -1,11 +1,11 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AdapterResult, AgentTaskRecord, AgentTaskStatus, CanonicalValue, NativeDispatch } from "../types.js";
 import type { ArtifactRecord } from "../types.js";
-import { agentTaskStatusForResult } from "../runtime/adapterResult.js";
+import { agentTaskStatusForResult, sanitizeAdapterResultForStorage } from "../runtime/adapterResult.js";
 import { stableStringify } from "../util/hash.js";
 
 export class FlowdexState {
@@ -17,6 +17,7 @@ export class FlowdexState {
     this.db = new DatabaseSync(filePath);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
         manifest_json TEXT NOT NULL,
@@ -173,6 +174,23 @@ export class FlowdexState {
     );
   }
 
+  rebuildEventProjection(runId?: string): number {
+    const rows = runId
+      ? this.db.prepare("SELECT seq, run_id, type, payload_json, created_at FROM events WHERE run_id = ? ORDER BY seq").all(runId)
+      : this.db.prepare("SELECT seq, run_id, type, payload_json, created_at FROM events ORDER BY seq").all();
+    const lines = rows.map((row) =>
+      JSON.stringify({
+        seq: Number(row.seq),
+        runId: String(row.run_id),
+        type: String(row.type),
+        payload: JSON.parse(String(row.payload_json)),
+        createdAt: String(row.created_at)
+      })
+    );
+    writeFileSync(this.jsonlPath, lines.length ? `${lines.join("\n")}\n` : "");
+    return lines.length;
+  }
+
   saveTaskResult(runId: string, opKey: string, status: string, result: unknown): void {
     this.db
       .prepare(
@@ -208,6 +226,11 @@ export class FlowdexState {
     return results;
   }
 
+  getTaskResult(runId: string, opKey: string): CanonicalValue | undefined {
+    const row = this.db.prepare("SELECT result_json FROM task_results WHERE run_id = ? AND op_key = ? AND status = 'completed'").get(runId, opKey);
+    return row ? (JSON.parse(String(row.result_json)) as CanonicalValue) : undefined;
+  }
+
   listEvents(runId: string): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT seq, type, payload_json, created_at FROM events WHERE run_id = ? ORDER BY seq").all(runId);
   }
@@ -234,10 +257,11 @@ export class FlowdexState {
       .prepare(
         `UPDATE agent_tasks
          SET status = 'pending', lease_token = NULL, lease_expires_at = NULL, agent_ref = NULL,
-             result_json = NULL, error = NULL, updated_at = ?
+             result_json = NULL, error = NULL, context_cwd = NULL, updated_at = ?
          WHERE run_id = ? AND (child_key = ? OR parent_op_key = ?)`
       )
       .run(new Date().toISOString(), runId, opKey, opKey);
+    this.db.prepare("UPDATE runs SET status = 'pending', updated_at = ? WHERE id = ?").run(new Date().toISOString(), runId);
     this.addEvent(runId, "task.invalidated", { opKey, resultKeys: [...resultKeys] });
   }
 
@@ -330,15 +354,23 @@ export class FlowdexState {
     });
   }
 
-  markAgentDispatchable(runId: string, childKey: string, contextCwd: string): void {
+  markAgentDispatchable(runId: string, childKey: string, contextCwd?: string): void {
     this.db
       .prepare(
         `UPDATE agent_tasks
          SET status = 'dispatchable', context_cwd = ?, updated_at = ?
          WHERE run_id = ? AND child_key = ? AND status IN ('pending', 'dispatchable')`
       )
+      .run(contextCwd ?? null, new Date().toISOString(), runId, childKey);
+    this.addEvent(runId, "native.dispatch.created", { childKey, ...(contextCwd ? { contextCwd } : {}) });
+  }
+
+  setAgentTaskContextCwd(runId: string, childKey: string, contextCwd: string): void {
+    const result = this.db
+      .prepare("UPDATE agent_tasks SET context_cwd = ?, updated_at = ? WHERE run_id = ? AND child_key = ?")
       .run(contextCwd, new Date().toISOString(), runId, childKey);
-    this.addEvent(runId, "native.dispatch.created", { childKey, contextCwd });
+    if (result.changes !== 1) throw new Error(`unknown child task: ${childKey}`);
+    this.addEvent(runId, "native.dispatch.snapshot", { childKey, contextCwd });
   }
 
   leaseDispatches(runId: string, limit: number, leaseMs = 30 * 60 * 1000): NativeDispatch[] {
@@ -346,6 +378,7 @@ export class FlowdexState {
     const nowIso = now.toISOString();
     const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
     const dispatches: NativeDispatch[] = [];
+    const events: Array<{ childKey: string; leaseToken: string; leaseExpiresAt: string; reclaimed: boolean }> = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const runStatus = this.getRunStatus(runId);
@@ -379,7 +412,11 @@ export class FlowdexState {
         .all(runId, nowIso, available);
       const update = this.db.prepare(
         `UPDATE agent_tasks
-         SET status = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ?
+         SET status = 'leased',
+             lease_token = ?,
+             lease_expires_at = ?,
+             context_cwd = CASE WHEN status IN ('leased', 'dispatched') THEN NULL ELSE context_cwd END,
+             updated_at = ?
          WHERE run_id = ? AND child_key = ?
            AND (
              status = 'dispatchable'
@@ -387,19 +424,36 @@ export class FlowdexState {
            )`
       );
       for (const row of rows) {
+        const reclaimed = String(row.status) === "leased" || String(row.status) === "dispatched";
         const leaseToken = randomUUID();
         const result = update.run(leaseToken, expiresAt, nowIso, runId, String(row.child_key), nowIso);
         if (result.changes !== 1) continue;
-        const record = rowToAgentTaskRecord({ ...row, status: "leased", lease_token: leaseToken, lease_expires_at: expiresAt });
+        const record = rowToAgentTaskRecord({ ...row, status: "leased", lease_token: leaseToken, lease_expires_at: expiresAt, context_cwd: reclaimed ? null : row.context_cwd });
         dispatches.push(recordToDispatch(record, leaseToken, expiresAt));
-        this.addEvent(runId, "native.dispatch.leased", { childKey: record.childKey, leaseToken, leaseExpiresAt: expiresAt });
+        events.push({ childKey: record.childKey, leaseToken, leaseExpiresAt: expiresAt, reclaimed });
       }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    for (const event of events) {
+      this.addEvent(runId, event.reclaimed ? "native.dispatch.reclaimed" : "native.dispatch.leased", event);
+    }
     return dispatches;
+  }
+
+  releaseLease(runId: string, childKey: string, leaseToken: string, error?: string): void {
+    const result = this.db
+      .prepare(
+        `UPDATE agent_tasks
+         SET status = 'dispatchable', lease_token = NULL, lease_expires_at = NULL, agent_ref = NULL,
+             context_cwd = NULL, error = ?, updated_at = ?
+         WHERE run_id = ? AND child_key = ? AND lease_token = ? AND status IN ('leased', 'dispatched')`
+      )
+      .run(error ?? null, new Date().toISOString(), runId, childKey, leaseToken);
+    if (result.changes !== 1) throw new Error(`cannot release lease for ${childKey}`);
+    this.addEvent(runId, "native.dispatch.released", { childKey, error });
   }
 
   attachAgent(runId: string, childKey: string, leaseToken: string, agentRef: string): void {
@@ -418,11 +472,48 @@ export class FlowdexState {
     if (!task) throw new Error(`unknown child task: ${childKey}`);
     if (task.leaseToken !== leaseToken) throw new Error(`lease token mismatch for ${childKey}`);
     if (task.status !== "leased" && task.status !== "dispatched") throw new Error(`child task is not leased: ${childKey}`);
-    const status = agentTaskStatusForResult(result);
-    this.updateAgentTaskStatus(runId, childKey, status, { result, error: result.error });
-    if (task.parentOpKey === childKey) {
-      this.saveTaskResult(runId, task.parentOpKey, "completed", result);
+    const storedResult = sanitizeAdapterResultForStorage(result);
+    const status = agentTaskStatusForResult(storedResult);
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `UPDATE agent_tasks
+           SET status = ?, result_json = ?, error = ?, updated_at = ?
+           WHERE run_id = ? AND child_key = ?`
+        )
+        .run(status, stableStringify(storedResult), storedResult.error ?? null, now, runId, childKey);
+      if (task.parentOpKey === childKey) {
+        this.db
+          .prepare(
+            `INSERT INTO task_results (run_id, op_key, result_json, status, updated_at)
+             VALUES (?, ?, ?, 'completed', ?)
+             ON CONFLICT(run_id, op_key) DO UPDATE SET result_json = excluded.result_json, status = excluded.status, updated_at = excluded.updated_at`
+          )
+          .run(runId, task.parentOpKey, stableStringify(storedResult), now);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
     }
+    this.addEvent(runId, agentEventType(status), { childKey, status, summary: storedResult.summary, adapterStatus: storedResult.status, ...(storedResult.error ? { error: storedResult.error } : {}) });
+    if (task.parentOpKey === childKey) this.addEvent(runId, "task.result", { opKey: task.parentOpKey, status: "completed" });
+  }
+
+  ensureSingleAgentTaskResult(runId: string, childKey: string): boolean {
+    const task = this.getAgentTask(runId, childKey);
+    if (!task?.result || task.parentOpKey !== childKey || this.getTaskResult(runId, task.parentOpKey) !== undefined) return false;
+    this.saveTaskResult(runId, task.parentOpKey, "completed", task.result);
+    return true;
+  }
+
+  recordAgentTaskCollectionError(runId: string, childKey: string, error: string): void {
+    this.db
+      .prepare("UPDATE agent_tasks SET error = ?, updated_at = ? WHERE run_id = ? AND child_key = ?")
+      .run(error, new Date().toISOString(), runId, childKey);
+    this.addEvent(runId, "native.result.error", { childKey, error });
   }
 
   getAgentTask(runId: string, childKey: string): AgentTaskRecord | undefined {
