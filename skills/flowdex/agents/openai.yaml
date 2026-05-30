@@ -1,0 +1,6 @@
+interface:
+  display_name: "Flowdex"
+  short_description: "Native-first workflow orchestration"
+  default_prompt: "Use $flowdex to run this as a native-subagent workflow; do not solve it in the parent."
+policy:
+  allow_implicit_invocation: false
