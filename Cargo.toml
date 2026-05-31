@@ -1,0 +1,30 @@
+[package]
+name = "flowdex"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Runtime-backed workflow orchestration for Codex-style sub-agent fanout"
+
+[lib]
+name = "flowdex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flowdex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+chrono = { version = "0.4.41", features = ["serde"] }
+hex = "0.4.3"
+json5 = "0.4.1"
+regex = "1.11.1"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
+sha2 = "0.10.9"
+uuid = { version = "1.8.0", features = ["v4"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.20.0"

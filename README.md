@@ -1,134 +1,138 @@
 # Flowdex
 
-Flowdex is a runtime-backed workflow system for Codex-style orchestration.
+Flowdex is a Cargo-built workflow runtime for durable Codex-style fanout.
 
-It is not a prompt-only skill. The `$flowdex` skill is an entrypoint; the
-authoritative semantics live in the `flowdex` CLI/runtime:
+It provides:
 
-- static manifest and workflow-body policy validation before approval
-- Deno sandbox replay ticks
-- durable `ctx.agent`, `ctx.fanout`, and `ctx.hostCommand` operations
-- SQLite-authoritative run state plus JSONL projection
-- immutable snapshot builder for read-only agent inputs
-- host-verified evidence and claim-backed final reports
-- resumable runs with terminal-state idempotence and basic lifecycle commands
-- native-subagent dispatch bridge for this Mac's Codex Desktop
-- explicit `ctx.integrate` patch application
+- static workflow document validation before approval
+- durable run state in SQLite with rebuildable event projections
+- host command execution through explicit allowlists
+- native dispatch packages for Codex workers
+- exact `AdapterResult` collection and validation
+- host-verified reports with claim-backed evidence
+- explicit patch integration through manifest write permissions
 
-## Commands
+## Quick Start
 
-```sh
-npm install
-npm run build
-npm link # optional; exposes the flowdex binary from the @flowdex/runtime package
-
-node dist/cli.js preview examples/hello.ts
-node dist/cli.js run examples/hello.ts --yes
-node dist/cli.js run examples/code-audit.ts --yes
-node dist/cli.js next <run-id> --json --files
-node dist/cli.js attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <native-id>
-node dist/cli.js collect-results <run-id> --continue --json
-node dist/cli.js status <run-id> --json --compact
-node dist/cli.js watch <run-id>
-node dist/cli.js list
-node dist/cli.js inspect <run-id>
-node dist/cli.js report <run-id> [--path json.path] [--raw]
-node dist/cli.js report <run-id> --paths
-node dist/cli.js complete-agent <run-id> <child-key> --lease-token <token> --result @<result-path>
-node dist/cli.js resume <run-id>
-node dist/cli.js pause <run-id>
-node dist/cli.js stop <run-id>
-node dist/cli.js repair-events <run-id>
-node dist/cli.js restart-agent <run-id> <op-key>
-node dist/cli.js save <run-id> <name>
-node dist/cli.js workflow list
-node dist/cli.js init code-audit .flowdex/workflows/code-audit.ts
+```bash
+cargo run -- preview examples/hello.flowdex.json
+cargo run -- run examples/hello.flowdex.json --yes
+cargo run -- run examples/code-audit.flowdex.json --yes
+cargo run -- next <run-id> --json --files
+cargo run -- collect-results <run-id> --continue --json
+cargo run -- report <run-id>
 ```
 
-## Workflow Contract
+Saved workflow commands:
 
-Workflow source must be exactly:
-
-```ts
-import { workflow } from "@flowdex/runtime";
-
-export default workflow(staticManifest, async (ctx) => {
-  // orchestration only
-});
+```bash
+cargo run -- save <run-id> <name>
+cargo run -- workflow list
+cargo run -- init code-audit .flowdex/workflows/code-audit.flowdex.json
 ```
 
-Use `ctx.fanout({ tasks: [...] })`. Do not pass task callback functions across
-the workflow boundary; durable operation arguments must be canonical JSON. Use
-`ctx.integrate({ patches: [...] })` to apply write-agent patches in an explicit
-integration phase. Flowdex preflights all patches in an integration operation
-before mutating the worktree, so a rejected later patch does not leave earlier
-patches applied.
+## Workflow Document
 
-Final reports that make factual claims should use `claimIds`. Claim-backed
-reports are filtered through host-verified evidence. `fileRange` evidence must
-point at existing lines in a snapshot, and `command` / `test` evidence must
-match a Flowdex-owned host command result, including argv and exit code.
+Workflow source is a static JSON document:
 
-Agent tasks create dispatch records for the `$flowdex` skill bridge. The Node
-runtime does not directly spawn Codex Desktop native subagents. In Desktop, the
-parent Codex session reads `flowdex next --files`, spawns exactly those native
-subagents with the returned `agentPrompt`, attaches their native ids, and lets
-`collect-results --continue` register completed AdapterResult files.
+```json
+{
+  "version": "flowdex.workflow.v1",
+  "manifest": {
+    "name": "example",
+    "maxAgents": 4,
+    "maxConcurrency": 4,
+    "defaultAdapter": "codex-native",
+    "permissions": {
+      "read": ["src/**", "tests/**"],
+      "write": [],
+      "hostCommands": [],
+      "network": "none",
+      "env": { "inherit": [] }
+    },
+    "phases": [{ "id": "review", "maxAgents": 4 }]
+  },
+  "steps": [
+    {
+      "type": "fanout",
+      "id": "review",
+      "phase": "review",
+      "tasks": [
+        { "id": "runtime", "phase": "review", "mode": "read-only", "prompt": "Review runtime risks. Return AdapterResult JSON." }
+      ]
+    },
+    {
+      "type": "report",
+      "id": "final",
+      "value": {
+        "title": "Review",
+        "results": { "$result": "fanout:review" }
+      }
+    }
+  ]
+}
+```
 
-Codex Desktop currently supports six active subagents at a time. Flowdex treats
-that as an active batch limit, not a workflow size limit: `next` leases six
-dispatches by default, while the durable queue may contain tens or hundreds of
-fanout tasks. Read snapshots are materialized when a dispatch is leased, so
-large fanouts do not eagerly copy a workspace for every queued task. Use
-`--files` for native dispatches so large prompts and cross-phase `task.data`
-stay in Flowdex-owned files instead of being pasted through the parent Codex
-context. Complete the current batch, run
-`collect-results --continue`, then `next --files` again to roll through the next
-batch. The parent Codex session should use the native spawn/wait tools for
-execution. Completed subagents may be left open for review; Flowdex only tracks
-the durable queue, file handoff, and validated AdapterResult boundary.
-Use `watch` or `status --json --compact` for progress checks; plain
-`status --json` includes full task and result payloads for debugging. Compact
-status includes the current `adapter-result.json` path for leased or dispatched
-native tasks so an operator can recover after losing the original `next --files`
-output. `collect-results` records missing, invalid, and stale-result diagnostics
-on the task record. Native worker `claims` and `artifacts` are validated for
-shape but stored as untrusted data (`flowdexUntrustedClaims` /
-`flowdexUntrustedArtifacts`); only parent-staged `claimIds` become
-host-verified final-report claims.
+Supported step types are `hostCommand`, `agent`, `fanout`, `integrate`, `claim`,
+and `report`. References are explicit data objects such as:
 
-`next --files` requeues leases if dispatch package writing fails before the
-worker can receive usable instructions. Expired leases can be reclaimed by a
-later `next`; if a worker writes an `adapter-result.json` under an older lease
-after reclaim, `collect-results` reports it as a stale result instead of
-silently ignoring it.
+```json
+{ "$result": "hostCommand:hello.run", "path": ["data", "stdoutArtifactId"] }
+```
 
-Flowdex is intentionally local-Codex-only: it does not ship a `codex-cli`
-fallback, external model broker, background worker, or write-worktree runner.
-If a native worker needs to propose edits, have it return a patch and apply it
-through an explicit `ctx.integrate` phase.
+The evaluator resolves references over `ctx.input`, current time, and completed
+operation results. It does not execute workflow source as code.
 
-Native research workflows can declare `permissions.network: "web"` so preview
-and saved manifests make web access intent explicit. Flowdex records this intent
-for approval and review; native workers still execute through Codex Desktop's
-tooling rather than a Flowdex-owned browser sandbox.
+## Native Dispatch
 
-Host commands are allowlisted in the manifest. They inherit `PATH` plus any
-variables listed in `permissions.env.inherit`, and they have bounded
-stdout/stderr capture. Use `timeoutMs` and `maxOutputBytes` when a command may
-be slow or noisy.
+`codex-native` is a durable dispatch bridge. Flowdex does not spawn or complete
+child sessions by itself. A normal native loop is:
 
-Completed runs are terminal: `resume` returns the completed report without
-replaying the workflow. Failed runs are also terminal until an explicit repair
-operation such as `restart-agent` invalidates the affected task.
+```bash
+cargo run -- run examples/code-audit.flowdex.json --yes
+cargo run -- next <run-id> --json --files
+# run workers from the generated instructions and write each adapter-result file
+cargo run -- collect-results <run-id> --continue --json
+```
 
-SQLite is the source of truth for run events. `events.jsonl` is a projection for
-inspection and can be rebuilt with `repair-events` if it is deleted or becomes
-stale.
+`next` leases six active workers by default. Treat that as a batch size, not a
+workflow size limit: `collect-results --continue`, then `next --files` again to
+roll through later batches.
+
+## Result Collection
+
+Every worker result must be exactly:
+
+```json
+{
+  "status": "completed",
+  "summary": "short summary",
+  "data": {},
+  "claims": [],
+  "artifacts": [],
+  "diff": null,
+  "usage": {},
+  "error": null
+}
+```
+
+Allowed statuses are `completed`, `failed`, `blocked`, and `needs-approval`.
+Worker claims and artifacts are stored as untrusted data unless the parent
+workflow promotes host-verified claims into the final report.
+
+## Recovery
+
+Completed runs resume idempotently and return the stored report. Paused and
+stopped runs remain suspended until explicitly resumed. `repair-events` rebuilds
+the event projection from SQLite-backed state. `restart-agent` invalidates a
+task result and resumes the run through the same static workflow document.
 
 ## Verification
 
-```sh
-npm run check
-npm run build
+```bash
+cargo fmt --all -- --check
+cargo test
+cargo build --release
+cargo run -- preview examples/hello.flowdex.json
+cargo run -- preview examples/code-audit.flowdex.json
 ```
