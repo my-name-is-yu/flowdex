@@ -14,6 +14,23 @@ It provides:
 
 ## Quick Start
 
+Install from npm:
+
+```bash
+npm install -g flowdex
+flowdex --help
+```
+
+The npm package builds the Rust CLI during install, so Rust/Cargo must be
+available on the installing machine.
+
+Install from a local checkout:
+
+```bash
+npm install -g .
+flowdex --help
+```
+
 ```bash
 cargo run -- preview examples/hello.flowdex.json
 cargo run -- run examples/hello.flowdex.json --yes

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Runtime-backed workflow orchestration for Codex-style sub-agent fanout"
+homepage = "https://github.com/my-name-is-yu/flowdex#readme"
+repository = "https://github.com/my-name-is-yu/flowdex"
+readme = "README.md"
 
 [lib]
 name = "flowdex"

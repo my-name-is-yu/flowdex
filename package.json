@@ -1,0 +1,48 @@
+{
+  "name": "flowdex",
+  "version": "0.1.0",
+  "description": "Runtime-backed workflow orchestration for Codex-style sub-agent fanout",
+  "license": "MIT",
+  "homepage": "https://github.com/my-name-is-yu/flowdex#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/my-name-is-yu/flowdex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/my-name-is-yu/flowdex/issues"
+  },
+  "keywords": [
+    "codex",
+    "workflow",
+    "agents",
+    "orchestration",
+    "runtime"
+  ],
+  "bin": {
+    "flowdex": "bin/flowdex.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "src/",
+    "tests/",
+    "examples/",
+    "skills/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/npm-postinstall.js",
+    "build": "cargo build --release --locked",
+    "check": "cargo fmt --all -- --check && cargo test",
+    "test:npm": "npm pack --dry-run && node bin/flowdex.js --help"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
