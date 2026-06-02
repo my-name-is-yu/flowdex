@@ -1,56 +1,78 @@
 # Flowdex
 
-Flowdex is a Cargo-built workflow runtime for durable Codex-style fanout.
+Flowdex is a Rust-built workflow runtime for durable Codex-style fanout.
 
-It provides:
+It runs static workflow documents, stores resumable run state, prepares native
+Codex worker dispatch packages, validates worker result envelopes, and produces
+host-verified reports from collected evidence.
 
-- static workflow document validation before approval
-- durable run state in SQLite with rebuildable event projections
-- host command execution through explicit allowlists
-- native dispatch packages for Codex workers
-- exact `AdapterResult` collection and validation
-- host-verified reports with claim-backed evidence
-- explicit patch integration through manifest write permissions
-
-## Quick Start
-
-Install from npm:
+## Install
 
 ```bash
 npm install -g flowdex
 flowdex --help
 ```
 
-The npm package builds the Rust CLI during install, so Rust/Cargo must be
-available on the installing machine.
+The npm package currently builds the Rust CLI during install. The installing
+machine needs:
 
-Install from a local checkout:
+- Node.js 18 or newer
+- Rust and Cargo
+
+To install from a local checkout:
 
 ```bash
 npm install -g .
 flowdex --help
 ```
 
-```bash
-cargo run -- preview examples/hello.flowdex.json
-cargo run -- run examples/hello.flowdex.json --yes
-cargo run -- run examples/code-audit.flowdex.json --yes
-cargo run -- next <run-id> --json --files
-cargo run -- collect-results <run-id> --continue --json
-cargo run -- report <run-id>
-```
+## Quick Start
 
-Saved workflow commands:
+Create and preview a reusable workflow document:
 
 ```bash
-cargo run -- save <run-id> <name>
-cargo run -- workflow list
-cargo run -- init code-audit .flowdex/workflows/code-audit.flowdex.json
+mkdir -p flowdex-demo
+cd flowdex-demo
+flowdex init code-audit code-audit.flowdex.json
+flowdex preview code-audit.flowdex.json
 ```
 
-## Workflow Document
+Start the workflow:
 
-Workflow source is a static JSON document:
+```bash
+flowdex run code-audit.flowdex.json --yes
+```
+
+The run command prints JSON containing `runId`. When the run needs Codex
+workers, lease the next batch:
+
+```bash
+flowdex next <run-id> --json --files
+```
+
+Run workers from the generated instruction files, write each result to its
+generated `resultPath`, then collect and continue:
+
+```bash
+flowdex collect-results <run-id> --continue --json
+flowdex report <run-id>
+```
+
+## What Flowdex Provides
+
+- static workflow validation before approval
+- durable run state in SQLite under `.flowdex/runs`
+- rebuildable event projections with `repair-events`
+- host command execution through explicit allowlists
+- native dispatch packages for Codex workers
+- exact `AdapterResult` envelope validation
+- host-verified reports with claim-backed evidence
+- explicit patch integration through manifest write permissions
+
+## Workflow Documents
+
+Workflow source is a static `.flowdex.json` document. It is data, not executable
+workflow code.
 
 ```json
 {
@@ -75,7 +97,12 @@ Workflow source is a static JSON document:
       "id": "review",
       "phase": "review",
       "tasks": [
-        { "id": "runtime", "phase": "review", "mode": "read-only", "prompt": "Review runtime risks. Return AdapterResult JSON." }
+        {
+          "id": "runtime",
+          "phase": "review",
+          "mode": "read-only",
+          "prompt": "Review runtime risks. Return AdapterResult JSON."
+        }
       ]
     },
     {
@@ -90,33 +117,43 @@ Workflow source is a static JSON document:
 }
 ```
 
-Supported step types are `hostCommand`, `agent`, `fanout`, `integrate`, `claim`,
-and `report`. References are explicit data objects such as:
+Supported step types:
+
+- `hostCommand`
+- `agent`
+- `fanout`
+- `integrate`
+- `claim`
+- `report`
+
+References are explicit data objects:
 
 ```json
 { "$result": "hostCommand:hello.run", "path": ["data", "stdoutArtifactId"] }
 ```
 
 The evaluator resolves references over `ctx.input`, current time, and completed
-operation results. It does not execute workflow source as code.
+operation results.
 
 ## Native Dispatch
 
-`codex-native` is a durable dispatch bridge. Flowdex does not spawn or complete
-child sessions by itself. A normal native loop is:
+`codex-native` is a durable bridge for Codex workers. Flowdex does not spawn or
+complete child sessions by itself.
+
+The normal loop is:
 
 ```bash
-cargo run -- run examples/code-audit.flowdex.json --yes
-cargo run -- next <run-id> --json --files
+flowdex run code-audit.flowdex.json --yes
+flowdex next <run-id> --json --files
 # run workers from the generated instructions and write each adapter-result file
-cargo run -- collect-results <run-id> --continue --json
+flowdex collect-results <run-id> --continue --json
 ```
 
 `next` leases six active workers by default. Treat that as a batch size, not a
-workflow size limit: `collect-results --continue`, then `next --files` again to
-roll through later batches.
+workflow size limit. After `collect-results --continue`, run `next --files`
+again to roll through later batches.
 
-## Result Collection
+## Worker Results
 
 Every worker result must be exactly:
 
@@ -144,12 +181,58 @@ stopped runs remain suspended until explicitly resumed. `repair-events` rebuilds
 the event projection from SQLite-backed state. `restart-agent` invalidates a
 task result and resumes the run through the same static workflow document.
 
-## Verification
+## Commands
+
+```bash
+flowdex preview <workflow.flowdex.json>
+flowdex run <workflow.flowdex.json> [--input JSON|@file] [--yes]
+flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.flowdex.json>
+flowdex list
+flowdex resume <run-id>
+flowdex continue <run-id>
+flowdex inspect <run-id>
+flowdex report <run-id> [--path json.path] [--raw] [--paths]
+flowdex next <run-id> --json [--files] [--limit N]
+flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>
+flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file
+flowdex collect-results <run-id> [--continue] [--json]
+flowdex status <run-id> [--json] [--compact]
+flowdex watch <run-id>
+flowdex pause <run-id>
+flowdex stop <run-id>
+flowdex repair-events <run-id>
+flowdex restart-agent <run-id> <op-key>
+flowdex save <run-id> <name>
+flowdex workflow list
+```
+
+## Saved Workflows
+
+```bash
+flowdex save <run-id> <name>
+flowdex workflow list
+flowdex init code-audit .flowdex/workflows/code-audit.flowdex.json
+```
+
+## Development
+
+Use Cargo directly when developing Flowdex:
 
 ```bash
 cargo fmt --all -- --check
 cargo test
-cargo build --release
+cargo build --release --locked
 cargo run -- preview examples/hello.flowdex.json
 cargo run -- preview examples/code-audit.flowdex.json
+```
+
+The npm package surface is intentionally thin: `bin/flowdex.js` launches the
+native binary built by `scripts/npm-postinstall.js`.
+
+Bundled examples are available from a source checkout:
+
+```bash
+flowdex preview examples/hello.flowdex.json
+flowdex run examples/hello.flowdex.json --yes
+flowdex preview examples/code-audit.flowdex.json
 ```
