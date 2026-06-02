@@ -19,6 +19,20 @@ machine needs:
 - Node.js 18 or newer
 - Rust and Cargo
 
+Install the optional Codex skill after the CLI is available:
+
+```bash
+flowdex skill install
+```
+
+By default this copies the bundled skill to `$CODEX_HOME/skills/flowdex` when
+`CODEX_HOME` is set, otherwise to `~/.codex/skills/flowdex`. To install into a
+specific skill directory:
+
+```bash
+flowdex skill install --target /path/to/skills/flowdex
+```
+
 To install from a local checkout:
 
 ```bash
@@ -187,6 +201,7 @@ task result and resumes the run through the same static workflow document.
 flowdex preview <workflow.flowdex.json>
 flowdex run <workflow.flowdex.json> [--input JSON|@file] [--yes]
 flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.flowdex.json>
+flowdex skill install [--target <skill-dir>] [--json]
 flowdex list
 flowdex resume <run-id>
 flowdex continue <run-id>

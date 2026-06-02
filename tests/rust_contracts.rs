@@ -3,6 +3,7 @@ use flowdex::manifest::{parse_run_workflow_source, parse_workflow_document};
 use flowdex::native_dispatch::write_native_dispatch_file_package;
 use flowdex::report_path::read_report_path;
 use flowdex::runtime::{FlowdexRuntime, RuntimeOptions};
+use flowdex::skill::{bundled_skill_source, install_skill_from};
 use flowdex::types::NativeDispatch;
 use serde_json::json;
 use std::fs;
@@ -128,4 +129,25 @@ fn reads_report_paths() {
         "ok"
     );
     assert!(read_report_path(&report, "result.items.nope").is_err());
+}
+
+#[test]
+fn installs_bundled_flowdex_skill() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp
+        .path()
+        .join("codex-home")
+        .join("skills")
+        .join("flowdex");
+    let summary = install_skill_from(&bundled_skill_source().unwrap(), &destination).unwrap();
+
+    assert_eq!(summary.skill, "flowdex");
+    assert!(summary.files_copied >= 2);
+    assert!(destination.join("SKILL.md").is_file());
+    assert!(destination.join("agents/openai.yaml").is_file());
+    assert!(
+        fs::read_to_string(destination.join("SKILL.md"))
+            .unwrap()
+            .contains("Flowdex")
+    );
 }

@@ -8,6 +8,7 @@ pub mod native_dispatch;
 pub mod report_path;
 pub mod runtime;
 pub mod sandbox;
+pub mod skill;
 pub mod snapshot;
 pub mod state;
 pub mod templates;

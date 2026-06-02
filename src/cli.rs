@@ -6,6 +6,7 @@ use crate::native_dispatch::{
 };
 use crate::report_path::{list_report_paths, read_report_path};
 use crate::runtime::{FlowdexRuntime, RuntimeOptions};
+use crate::skill::install_bundled_skill;
 use crate::snapshot::build_snapshot;
 use crate::state::FlowdexState;
 use crate::templates::template_for;
@@ -52,6 +53,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "save" => save_command(&cwd, target, &rest),
         "workflow" => workflow_command(&cwd, target),
         "init" => init_command(&cwd, target, &rest),
+        "skill" => skill_command(target, &rest),
         _ => bail!("unknown command: {command}"),
     }
 }
@@ -471,6 +473,26 @@ fn init_command(cwd: &Path, target: Option<&str>, rest: &[String]) -> Result<()>
     Ok(())
 }
 
+fn skill_command(target: Option<&str>, rest: &[String]) -> Result<()> {
+    if target == Some("install") {
+        let destination = read_flag(rest, "--target").map(PathBuf::from);
+        let summary = install_bundled_skill(destination)?;
+        if rest.iter().any(|item| item == "--json") {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            println!(
+                "installed {} skill\nsource: {}\ndestination: {}\nfiles: {}",
+                summary.skill,
+                summary.source.to_string_lossy(),
+                summary.destination.to_string_lossy(),
+                summary.files_copied
+            );
+        }
+        return Ok(());
+    }
+    bail!("flowdex skill supports: install [--target <skill-dir>] [--json]")
+}
+
 fn write_run_summary(run_id: &str, status: &str, report: Option<&CanonicalValue>) -> Result<()> {
     println!(
         "{}",
@@ -531,7 +553,7 @@ fn resolve_workflow_path(cwd: &Path, target: &str) -> PathBuf {
 
 fn print_help() {
     print!(
-        "flowdex\n\nUsage:\n  flowdex preview <workflow.flowdex.json>\n  flowdex run <workflow.flowdex.json> [--input JSON|@file] [--yes]\n  flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.flowdex.json>\n  flowdex list\n  flowdex resume <run-id>\n  flowdex continue <run-id>\n  flowdex inspect <run-id>\n  flowdex report <run-id> [--path json.path] [--raw] [--paths]\n  flowdex next <run-id> --json [--files] [--limit N]\n  flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>\n  flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file\n  flowdex collect-results <run-id> [--continue] [--json]\n  flowdex status <run-id> [--json] [--compact]\n  flowdex watch <run-id>\n  flowdex pause <run-id>\n  flowdex stop <run-id>\n  flowdex repair-events <run-id>\n  flowdex restart-agent <run-id> <op-key>\n  flowdex save <run-id> <name>\n  flowdex workflow list\n"
+        "flowdex\n\nUsage:\n  flowdex preview <workflow.flowdex.json>\n  flowdex run <workflow.flowdex.json> [--input JSON|@file] [--yes]\n  flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.flowdex.json>\n  flowdex skill install [--target <skill-dir>] [--json]\n  flowdex list\n  flowdex resume <run-id>\n  flowdex continue <run-id>\n  flowdex inspect <run-id>\n  flowdex report <run-id> [--path json.path] [--raw] [--paths]\n  flowdex next <run-id> --json [--files] [--limit N]\n  flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>\n  flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file\n  flowdex collect-results <run-id> [--continue] [--json]\n  flowdex status <run-id> [--json] [--compact]\n  flowdex watch <run-id>\n  flowdex pause <run-id>\n  flowdex stop <run-id>\n  flowdex repair-events <run-id>\n  flowdex restart-agent <run-id> <op-key>\n  flowdex save <run-id> <name>\n  flowdex workflow list\n"
     );
 }
 
