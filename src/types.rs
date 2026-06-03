@@ -66,82 +66,13 @@ pub struct WorkflowPhase {
     pub max_agents: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkflowDocument {
-    pub version: String,
-    pub manifest: WorkflowManifest,
-    pub steps: Vec<WorkflowStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum WorkflowStep {
-    HostCommand {
-        id: String,
-        phase: String,
-        command_id: String,
-    },
-    Agent {
-        id: String,
-        phase: String,
-        mode: String,
-        prompt: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        schema: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        adapter: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        network: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        role: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        nickname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        data: Option<CanonicalValue>,
-    },
-    Fanout {
-        id: String,
-        phase: String,
-        tasks: Vec<AgentTask>,
-    },
-    Integrate {
-        id: String,
-        phase: String,
-        patches: Vec<PatchSpec>,
-    },
-    Claim {
-        id: String,
-        claim: CanonicalValue,
-    },
-    Report {
-        id: String,
-        value: CanonicalValue,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PatchSpec {
-    pub patch: CanonicalValue,
-}
-
 #[derive(Debug, Clone)]
 pub struct ParsedWorkflow {
     pub manifest: WorkflowManifest,
     pub source_hash: String,
     pub manifest_hash: String,
     pub approval_hash: String,
-    pub document: WorkflowDocument,
+    pub transformed_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

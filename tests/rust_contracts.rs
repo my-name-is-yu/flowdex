@@ -1,33 +1,34 @@
 use flowdex::adapter_result::validate_adapter_result;
-use flowdex::manifest::{parse_run_workflow_source, parse_workflow_document};
+use flowdex::dynamic_sandbox::run_dynamic_workflow_tick;
+use flowdex::manifest::parse_workflow_source;
 use flowdex::native_dispatch::write_native_dispatch_file_package;
 use flowdex::report_path::read_report_path;
 use flowdex::runtime::{FlowdexRuntime, RuntimeOptions};
 use flowdex::skill::{bundled_skill_source, install_skill_from};
 use flowdex::types::NativeDispatch;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 
 #[test]
 fn parses_bundled_examples() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let hello = fs::read_to_string(format!("{root}/examples/hello.flowdex.json")).unwrap();
-    let code_audit =
-        fs::read_to_string(format!("{root}/examples/code-audit.flowdex.json")).unwrap();
+    let hello = fs::read_to_string(format!("{root}/examples/hello.ts")).unwrap();
+    let dynamic_code_audit = fs::read_to_string(format!("{root}/examples/code-audit.ts")).unwrap();
 
-    let hello = parse_workflow_document(&hello, "examples/hello.flowdex.json").unwrap();
-    let code_audit =
-        parse_workflow_document(&code_audit, "examples/code-audit.flowdex.json").unwrap();
+    let hello = parse_workflow_source(&hello, "examples/hello.ts").unwrap();
+    let dynamic_code_audit =
+        parse_workflow_source(&dynamic_code_audit, "examples/code-audit.ts").unwrap();
 
     assert_eq!(hello.manifest.name, "hello-host-command");
-    assert_eq!(code_audit.manifest.name, "code-audit");
-    assert_eq!(code_audit.manifest.phases[0].id, "review");
+    assert_eq!(dynamic_code_audit.manifest.name, "code-audit");
+    assert_eq!(dynamic_code_audit.manifest.phases[0].id, "review");
     assert_eq!(hello.approval_hash.len(), 64);
-    assert_eq!(hello.document.steps.len(), 3);
+    assert!(hello.transformed_source.contains("__flowdexWorkflow"));
 }
 
 #[test]
-fn rejects_import_prefixed_workflow_source() {
+fn rejects_non_ts_workflow_source() {
     let source = r#"import "flowdex";
 {
   "version": "flowdex.workflow.v1",
@@ -35,12 +36,12 @@ fn rejects_import_prefixed_workflow_source() {
   "steps": []
 }
 "#;
-    let file_name = "workflow.flowdex.json";
-    let error = parse_run_workflow_source(source, &file_name)
+    let file_name = "workflow.json";
+    let error = parse_workflow_source(source, &file_name)
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("workflow source must be a static .flowdex.json document"));
+    assert!(error.contains("workflow source file name must end in .ts"));
 }
 
 #[test]
@@ -72,17 +73,105 @@ fn validates_exact_adapter_result_envelope() {
 }
 
 #[test]
-fn runs_host_command_example_to_completed_report() {
+fn runs_dynamic_host_command_example_to_completed_report() {
     let root = env!("CARGO_MANIFEST_DIR");
     let temp = tempfile::tempdir().unwrap();
     let mut options = RuntimeOptions::new(temp.path().to_path_buf());
     options.auto_approve = true;
     let summary = FlowdexRuntime::new(options)
-        .run(&std::path::Path::new(root).join("examples/hello.flowdex.json"))
+        .run(&std::path::Path::new(root).join("examples/hello.ts"))
         .unwrap();
 
     assert_eq!(summary.status, "completed");
     assert_eq!(summary.report.unwrap()["title"], "Hello host command");
+}
+
+#[test]
+fn dynamic_sandbox_suspends_and_replays_durable_operations() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let source = fs::read_to_string(format!("{root}/examples/hello.ts")).unwrap();
+    let parsed = parse_workflow_source(&source, "examples/hello.ts").unwrap();
+    let first = run_dynamic_workflow_tick(
+        &parsed.transformed_source,
+        &json!({}),
+        "2026-05-29T00:00:00.000Z",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let flowdex::types::TickResult::Pending { scheduled } = first else {
+        panic!("expected pending dynamic tick");
+    };
+    assert_eq!(scheduled[0].kind, "hostCommand");
+    assert_eq!(scheduled[0].id, "hello.run");
+
+    let mut results = BTreeMap::new();
+    results.insert(
+        "hostCommand:hello.run".to_string(),
+        json!({
+            "status": "completed",
+            "data": {
+                "exitCode": 0,
+                "stdoutArtifactId": "stdout-1"
+            }
+        }),
+    );
+    let second = run_dynamic_workflow_tick(
+        &parsed.transformed_source,
+        &json!({}),
+        "2026-05-29T00:00:00.000Z",
+        &results,
+    )
+    .unwrap();
+    let flowdex::types::TickResult::Completed { staged, .. } = second else {
+        panic!("expected completed dynamic tick");
+    };
+    assert_eq!(staged.reports[0]["exitCode"], 0);
+    assert_eq!(staged.reports[0]["stdoutArtifactId"], "stdout-1");
+}
+
+#[test]
+fn dynamic_workflow_can_build_fanout_from_runtime_input() {
+    let source = r#"import { workflow } from "@flowdex/runtime";
+export default workflow({
+  name: "dynamic-input-fanout",
+  maxAgents: 8,
+  maxConcurrency: 4,
+  defaultAdapter: "codex-native",
+  permissions: {
+    read: ["README.md"],
+    write: [],
+    hostCommands: [],
+    network: "none",
+    env: { inherit: [] }
+  },
+  phases: [{ id: "review", maxAgents: 8 }]
+}, async (ctx) => {
+  const tasks = [];
+  for (let index = 0; index < ctx.input.count; index++) {
+    tasks.push({
+      id: `review-${index}`,
+      phase: "review",
+      mode: "read-only",
+      prompt: `Review shard ${index}. Return AdapterResult JSON.`
+    });
+  }
+  const reviews = await ctx.fanout({ id: `dynamic-${ctx.input.count}`, phase: "review", tasks });
+  return ctx.report({ count: reviews.length });
+});"#;
+    let parsed = parse_workflow_source(source, "dynamic-input-fanout.ts").unwrap();
+    let first = run_dynamic_workflow_tick(
+        &parsed.transformed_source,
+        &json!({ "count": 3 }),
+        "2026-05-29T00:00:00.000Z",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let flowdex::types::TickResult::Pending { scheduled } = first else {
+        panic!("expected pending dynamic tick");
+    };
+    assert_eq!(scheduled[0].kind, "fanout");
+    assert_eq!(scheduled[0].id, "dynamic-3");
+    assert_eq!(scheduled[0].args["tasks"].as_array().unwrap().len(), 3);
 }
 
 #[test]

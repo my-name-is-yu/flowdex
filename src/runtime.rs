@@ -1,8 +1,8 @@
 use crate::artifacts::ArtifactStore;
 use crate::canonical::{stable_stringify, to_canonical_value};
+use crate::dynamic_sandbox::run_dynamic_workflow_tick;
 use crate::host_command::{command_result_for_storage, env_inherit_list, run_host_command};
-use crate::manifest::{format_preview, is_safe_id, parse_workflow_document};
-use crate::sandbox::{evaluate_static_workflow_tick, operation_key};
+use crate::manifest::{format_preview, is_safe_id, parse_workflow_source};
 use crate::state::{EnsureAgentTask, FlowdexState};
 use crate::types::{
     AdapterConfig, AdapterResult, AgentTask, CanonicalValue, Claim, EvidenceRef, ParsedWorkflow,
@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const WORKFLOW_DOCUMENT_FILE: &str = "workflow.flowdex.json";
+const WORKFLOW_TS_FILE: &str = "workflow.ts";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
@@ -58,12 +58,12 @@ impl FlowdexRuntime {
 
     pub fn preview(&self, workflow_path: &Path) -> Result<ParsedWorkflow> {
         let source = fs::read_to_string(workflow_path)?;
-        parse_workflow_document(&source, &workflow_path.to_string_lossy())
+        parse_workflow_source(&source, &workflow_path.to_string_lossy())
     }
 
     pub fn run(&self, workflow_path: &Path) -> Result<RunSummary> {
         let source = fs::read_to_string(workflow_path)?;
-        let parsed = parse_workflow_document(&source, &workflow_path.to_string_lossy())?;
+        let parsed = parse_workflow_source(&source, &workflow_path.to_string_lossy())?;
         if !self.options.auto_approve {
             bail!(
                 "Flowdex approval required. Re-run with --yes after reviewing:\n{}",
@@ -80,7 +80,7 @@ impl FlowdexRuntime {
         }
         let run_root = FlowdexState::run_directory(&self.options.cwd, &run_id)?;
         fs::create_dir_all(&run_root)?;
-        fs::write(run_root.join(WORKFLOW_DOCUMENT_FILE), source)?;
+        fs::write(run_root.join(WORKFLOW_TS_FILE), source)?;
         fs::write(
             run_root.join("input.json"),
             stable_stringify(&self.options.input)?,
@@ -107,7 +107,7 @@ impl FlowdexRuntime {
         let run_root = FlowdexState::run_directory(&self.options.cwd, run_id)?;
         let source_path = run_workflow_source_path(&run_root)?;
         let source = fs::read_to_string(&source_path)?;
-        let parsed = parse_workflow_document(&source, &source_path.to_string_lossy())?;
+        let parsed = parse_workflow_source(&source, &source_path.to_string_lossy())?;
         let input =
             serde_json::from_str::<Value>(&fs::read_to_string(run_root.join("input.json"))?)?;
         let artifact_store = ArtifactStore::new(run_root.join("artifacts"));
@@ -189,12 +189,13 @@ impl FlowdexRuntime {
             }
             state.heartbeat(run_id)?;
             let completed_results = state.get_completed_results(run_id)?;
-            let tick_result = evaluate_static_workflow_tick(
-                &parsed.document,
+            let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let tick_result = run_dynamic_workflow_tick(
+                &parsed.transformed_source,
                 input,
-                &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                &now,
                 &completed_results,
-            );
+            )?;
             match tick_result {
                 TickResult::Completed { value, staged } => {
                     let raw_report = staged.reports.last().cloned().unwrap_or(value);
@@ -733,11 +734,15 @@ fn fanout_child_key(fanout_id: &str, task_id: &str) -> String {
 }
 
 fn run_workflow_source_path(run_root: &Path) -> Result<PathBuf> {
-    let primary = run_root.join(WORKFLOW_DOCUMENT_FILE);
-    if primary.is_file() {
-        return Ok(primary);
+    let path = run_root.join(WORKFLOW_TS_FILE);
+    if path.is_file() {
+        return Ok(path);
     }
-    bail!("run package is missing workflow.flowdex.json")
+    bail!("run package is missing workflow.ts")
+}
+
+fn operation_key(operation: &ScheduledOperation) -> String {
+    format!("{}:{}", operation.kind, operation.id)
 }
 
 fn blocked_result(task: &AgentTask, reason: &str) -> AdapterResult {

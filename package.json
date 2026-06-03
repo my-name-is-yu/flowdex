@@ -1,6 +1,6 @@
 {
   "name": "flowdex",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Runtime-backed workflow orchestration for Codex-style sub-agent fanout",
   "license": "MIT",
   "homepage": "https://github.com/my-name-is-yu/flowdex#readme",

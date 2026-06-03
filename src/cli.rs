@@ -1,6 +1,6 @@
 use crate::adapter_result::validate_adapter_result;
 use crate::canonical::{stable_stringify, stable_stringify_pretty};
-use crate::manifest::{format_preview, is_safe_id, parse_workflow_document};
+use crate::manifest::{format_preview, is_safe_id, parse_workflow_source};
 use crate::native_dispatch::{
     collect_native_result_files, native_dispatch_result_path, write_native_dispatch_file_package,
 };
@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 const CODEX_DESKTOP_ACTIVE_AGENT_LIMIT: usize = 6;
 const SNAPSHOT_MANIFEST_FILE: &str = ".flowdex-snapshot.json";
-const WORKFLOW_DOCUMENT_FILE: &str = "workflow.flowdex.json";
-const WORKFLOW_FILE_SUFFIX: &str = ".flowdex.json";
+const WORKFLOW_TS_FILE: &str = "workflow.ts";
+const WORKFLOW_TS_FILE_SUFFIX: &str = ".ts";
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -61,7 +61,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 fn preview_command(cwd: &Path, target: Option<&str>) -> Result<()> {
     let target = target.ok_or_else(|| anyhow!("flowdex preview requires a workflow path"))?;
     let workflow_path = resolve_workflow_path(cwd, target);
-    let parsed = parse_workflow_document(
+    let parsed = parse_workflow_source(
         &fs::read_to_string(&workflow_path)?,
         &workflow_path.to_string_lossy(),
     )?;
@@ -408,11 +408,11 @@ fn save_command(cwd: &Path, target: Option<&str>, rest: &[String]) -> Result<()>
     if !is_safe_workflow_name(name) {
         bail!("flowdex save workflow name must be a safe id");
     }
-    let run_workflow = FlowdexState::run_directory(cwd, run_id)?.join(WORKFLOW_DOCUMENT_FILE);
+    let run_workflow = FlowdexState::run_directory(cwd, run_id)?.join(WORKFLOW_TS_FILE);
     let destination = cwd
         .join(".flowdex")
         .join("workflows")
-        .join(format!("{name}{WORKFLOW_FILE_SUFFIX}"));
+        .join(format!("{name}{WORKFLOW_TS_FILE_SUFFIX}"));
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -441,7 +441,8 @@ fn workflow_command(cwd: &Path, target: Option<&str>) -> Result<()> {
             })
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                name.strip_suffix(WORKFLOW_FILE_SUFFIX).map(str::to_string)
+                name.strip_suffix(WORKFLOW_TS_FILE_SUFFIX)
+                    .map(str::to_string)
             })
             .collect::<Vec<_>>();
         entries.sort();
@@ -544,16 +545,16 @@ fn resolve_workflow_path(cwd: &Path, target: &str) -> PathBuf {
     if direct.is_file() {
         return direct;
     }
-    let saved = cwd
+    let saved_ts = cwd
         .join(".flowdex")
         .join("workflows")
-        .join(format!("{target}{WORKFLOW_FILE_SUFFIX}"));
-    if saved.is_file() { saved } else { direct }
+        .join(format!("{target}{WORKFLOW_TS_FILE_SUFFIX}"));
+    if saved_ts.is_file() { saved_ts } else { direct }
 }
 
 fn print_help() {
     print!(
-        "flowdex\n\nUsage:\n  flowdex preview <workflow.flowdex.json>\n  flowdex run <workflow.flowdex.json> [--input JSON|@file] [--yes]\n  flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.flowdex.json>\n  flowdex skill install [--target <skill-dir>] [--json]\n  flowdex list\n  flowdex resume <run-id>\n  flowdex continue <run-id>\n  flowdex inspect <run-id>\n  flowdex report <run-id> [--path json.path] [--raw] [--paths]\n  flowdex next <run-id> --json [--files] [--limit N]\n  flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>\n  flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file\n  flowdex collect-results <run-id> [--continue] [--json]\n  flowdex status <run-id> [--json] [--compact]\n  flowdex watch <run-id>\n  flowdex pause <run-id>\n  flowdex stop <run-id>\n  flowdex repair-events <run-id>\n  flowdex restart-agent <run-id> <op-key>\n  flowdex save <run-id> <name>\n  flowdex workflow list\n"
+        "flowdex\n\nUsage:\n  flowdex preview <workflow.ts>\n  flowdex run <workflow.ts> [--input JSON|@file] [--yes]\n  flowdex init <code-audit|parallel-review|implementation-fanout> <workflow.ts>\n  flowdex skill install [--target <skill-dir>] [--json]\n  flowdex list\n  flowdex resume <run-id>\n  flowdex continue <run-id>\n  flowdex inspect <run-id>\n  flowdex report <run-id> [--path json.path] [--raw] [--paths]\n  flowdex next <run-id> --json [--files] [--limit N]\n  flowdex attach-agent <run-id> <child-key> --lease-token <token> --agent-ref <id>\n  flowdex complete-agent <run-id> <child-key> --lease-token <token> --result @file\n  flowdex collect-results <run-id> [--continue] [--json]\n  flowdex status <run-id> [--json] [--compact]\n  flowdex watch <run-id>\n  flowdex pause <run-id>\n  flowdex stop <run-id>\n  flowdex repair-events <run-id>\n  flowdex restart-agent <run-id> <op-key>\n  flowdex save <run-id> <name>\n  flowdex workflow list\n"
     );
 }
 
